@@ -8,9 +8,12 @@ fn main() {
         let _worker = thread::spawn(
             move || {
                 match stream {
-                    Ok(mut stream) => {
+                    Ok(mut stream) => loop {
                         let mut buffer = [0; 1024];
-                        stream.read(&mut buffer).unwrap();
+                        let read_count = stream.read(&mut buffer).unwrap();
+                        if read_count == 0 {
+                            break;
+                        }
                         if stream.write_all(simple_resp("PONG").as_bytes()).is_err() {
                             println!("Error writing to stream");
                         }
