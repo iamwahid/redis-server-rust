@@ -1,59 +1,121 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Read, Write};
-use std::net::TcpListener;
+use std::io::{stdout, BufRead, Write};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::{env, env::Args};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::WriteHalf;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, Instant};
 
 const DEFAULT_PORT: u16 = 6379;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let data_store: Arc<Mutex<HashMap<String, DataStoreValue>>> =
         Arc::new(Mutex::new(HashMap::new()));
     // parse cli args
     let parsed = parse_args(env::args());
 
-    let server_repl_config: Arc<Mutex<ServerReplicationConfig>> =
-        Arc::new(Mutex::new(ServerReplicationConfig {
-            role: String::from("master"),
-            master_replid: String::from("8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"),
-            master_repl_offset: 0,
-        }));
+    // config values
+    let mut server_repl_config = ServerReplicationConfig {
+        role: String::from("master"),
+        master_replid: String::from("8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"),
+        master_repl_offset: 0,
+        ..ServerReplicationConfig::default()
+    };
+
     let mut bind_address = format!("127.0.0.1:{}", DEFAULT_PORT);
     for arg in parsed.into_iter() {
         match arg {
             ServerArg::Port(port) => {
                 bind_address = format!("127.0.0.1:{}", port);
             }
-            ServerArg::ReplicaOf(_host, _port) => {
-                server_repl_config.lock().unwrap().role = String::from("slave");
+            ServerArg::ReplicaOf(host, port) => {
+                server_repl_config.role = String::from("slave");
+                server_repl_config.master_host = Some(host);
+                server_repl_config.master_port = Some(port);
             }
         }
     }
 
-    let listener = TcpListener::bind(bind_address).unwrap();
-    for stream in listener.incoming() {
-        let data_store = data_store.clone();
-        let server_repl_config = server_repl_config.clone();
-        let _worker = thread::spawn(move || match stream {
-            Ok(mut stream) => loop {
-                let mut buffer = [0; 1024];
-                let read_count = stream.read(&mut buffer).unwrap_or_default();
-                if read_count == 0 {
-                    break;
-                }
+    let listener = TcpListener::bind(bind_address).await.unwrap();
 
-                let response = process_req(&buffer, data_store.clone(), server_repl_config.clone());
-
-                if stream.write_all(response.as_bytes()).is_err() {
-                    println!("Error writing to stream");
+    let mut replication_stream = if let (server_type, Some(master_host), Some(master_port)) = (
+        &server_repl_config.role,
+        &server_repl_config.master_host,
+        server_repl_config.master_port,
+    ) {
+        if server_type.as_str() == "slave" {
+            let mut client = TcpStream::connect((master_host.clone(), master_port))
+                .await
+                .expect("Failed to connect Master");
+            // connection handshake
+            let (input_stream, output_stream) = &mut client.split();
+            if output_stream
+                .write_all(array_resp(vec!["PING".to_string()]).as_bytes())
+                .await
+                .is_ok()
+            {
+                let mut client_buffer = [0u8; 512];
+                match input_stream.read(&mut client_buffer).await {
+                    Ok(n) => {
+                        if n == 0 {
+                            println!("REPL: PING Failed!");
+                        } else {
+                            println!("REPL: Replication connected!");
+                            // stdout().write(&client_buffer).unwrap();
+                            // stdout().flush().unwrap();
+                        }
+                    }
+                    Err(_error) => (),
                 }
-            },
-            Err(e) => {
-                println!("error: {}", e);
+            } else {
+                println!("REPL: replication connection failed!");
             }
-        });
+
+            Some(client)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    println!("MAIN: Server running ...");
+
+    let server_repl_config: Arc<Mutex<ServerReplicationConfig>> =
+        Arc::new(Mutex::new(server_repl_config));
+
+    loop {
+        // Replication
+        if let Some(ref mut replication_stream) = replication_stream {
+            let (input_stream, output_stream) = &mut replication_stream.split();
+
+            let mut client_buffer = [0u8; 1024];
+            tokio::select! {
+                stream = listener.accept() => {
+                    let (stream, _) = stream.unwrap();
+                    process_connection(stream, data_store.clone(), server_repl_config.clone()).await;
+                },
+                repl_buffer = input_stream.read(&mut client_buffer) => {
+                    match repl_buffer {
+                        Ok(n) => {
+                            if n == 0 {
+                                println!("REPL: master disconnected!");
+                                break;
+                            } else {
+                                println!("REPL: {:?}", client_buffer);
+                                process_repl_connection(client_buffer, output_stream).await;
+                            }
+                        },
+                        Err(_error) => (),
+                    }
+                }
+            }
+        } else {
+            let (stream, _) = listener.accept().await.unwrap();
+            process_connection(stream, data_store.clone(), server_repl_config.clone()).await;
+        }
     }
 }
 
@@ -70,12 +132,21 @@ fn bulk_string_resp(message: &str) -> String {
     format!("${}\r\n{}\r\n", message.len(), message)
 }
 
+fn array_resp(messages: Vec<String>) -> String {
+    let mut resp = format!("*{}\r\n", messages.len());
+    for message in messages.into_iter() {
+        resp = format!("{}{}", resp, bulk_string_resp(message.as_str()));
+    }
+    resp
+}
+
 #[derive(Hash, Eq, PartialEq, Debug)]
 enum ServerArg {
     Port(u16),
     ReplicaOf(String, u16),
 }
 
+#[derive(Debug)]
 enum Command {
     Ping,
     Echo,
@@ -96,10 +167,45 @@ struct DataStoreValue {
     expired_in: Option<Duration>,
 }
 
+#[derive(Default, Debug)]
 struct ServerReplicationConfig {
     role: String,
     master_replid: String,
     master_repl_offset: u8,
+    master_host: Option<String>,
+    master_port: Option<u16>,
+}
+
+async fn process_connection(
+    mut stream: TcpStream,
+    data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>,
+    server_repl_config: Arc<Mutex<ServerReplicationConfig>>,
+) {
+    let data_store = data_store.clone();
+    let server_repl_config = server_repl_config.clone();
+    let _worker = tokio::spawn(async move {
+        loop {
+            let mut buffer = [0; 1024];
+            let read_count = stream.read(&mut buffer).await.unwrap_or_default();
+            if read_count == 0 {
+                break;
+            }
+
+            let response = process_req(&buffer, data_store.clone(), server_repl_config.clone());
+
+            if stream.write_all(response.as_bytes()).await.is_err() {
+                println!("Error writing to stream");
+            }
+        }
+    });
+}
+
+async fn process_repl_connection<'a>(
+    mut _client_buffer: [u8; 1024],
+    output_stream: &mut WriteHalf<'a>,
+) {
+    output_stream.write("user_buffer".as_bytes()).await.unwrap();
+    output_stream.flush().await.unwrap();
 }
 
 fn parse_args(args: Args) -> HashSet<ServerArg> {
