@@ -81,10 +81,11 @@ async fn main() {
                             if n == 0 {
                                 println!("REPL: master disconnected!");
                                 break;
-                            } else {
-                                // println!("REPL: {:?}", client_buffer);
-                                process_repl_connection(client_buffer, output_stream).await;
                             }
+                            //  else {
+                            //     // println!("REPL: {:?}", client_buffer);
+                            //     // process_repl_connection(client_buffer, output_stream).await;
+                            // }
                         },
                         Err(_error) => (),
                     }
