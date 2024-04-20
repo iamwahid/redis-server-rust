@@ -3,10 +3,11 @@ use std::net::TcpListener;
 use std::io::{BufRead, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use tokio::time::{Duration, Instant};
 
 
 fn main() {
-    let data_store: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let data_store: Arc<Mutex<HashMap<String, DataStoreValue>>> = Arc::new(Mutex::new(HashMap::new()));
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
     for stream in listener.incoming() {
         let data_store = data_store.clone();
@@ -51,8 +52,20 @@ enum Command {
     Get,
 }
 
+#[derive(Debug)]
+enum SetExpiry {
+    Ex,
+    Px,
+}
+
+struct DataStoreValue {
+    value: String,
+    created_at: Instant,
+    expired_in: Option<Duration>,
+}
+
 // parse buffer as vector
-fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, String>>>) -> String {
+fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>) -> String {
     let mut response = simple_resp("");
     let command: Vec<_> = buffer
         .lines()
@@ -77,7 +90,7 @@ fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, Strin
 
     let mut command_items = Vec::with_capacity(command_length as usize);
     let mut offset = 1;
-    while offset <= command_length+2 {
+    while command_items.len() < command_length as usize {
         match (command.get(offset as usize), command.get(offset as usize + 1)) {
             (Some(com1), Some(com2)) => {
                 command_items.push((com1, com2));
@@ -112,7 +125,6 @@ fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, Strin
                 match command_items.get(1) {
                     Some((_pre, message)) => {
                         let message = *message;
-                        println!("{}", message);
                         response = simple_resp(message.as_str());
                     },
                     None => {
@@ -128,7 +140,6 @@ fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, Strin
                 let key = match command_items.get(1) {
                     Some((_pre, message)) => {
                         let message = *message;
-                        println!("key {}", message);
                         Some(message.clone())
                     },
                     None => None
@@ -136,14 +147,43 @@ fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, Strin
                 let value = match command_items.get(2) {
                     Some((_pre, message)) => {
                         let message = *message;
-                        println!("value {}", message);
                         Some(message.clone())
                     },
                     None => None
                 };
-                match (key, value) {
-                    (Some(key), Some(value)) => {
-                        data_store.lock().unwrap().insert(key, value);
+                let expiry_type = match command_items.get(3) {
+                    Some((_pre, command)) => {
+                        let command = *command;
+                        match command.to_ascii_lowercase().as_str() {
+                            "ex" => {
+                                Some(SetExpiry::Ex)
+                            },
+                            "px" => {
+                                Some(SetExpiry::Px)
+                            },
+                            _ => None
+                        }
+                    },
+                    None => None
+                };
+                let expiry_number = match command_items.get(4) {
+                    Some((_pre, expiry)) => {
+                        let expiry = *expiry;
+                        Some(expiry.clone().parse::<u64>().unwrap_or(0))
+                    },
+                    None => None
+                };
+                match (key, value, expiry_type, expiry_number) {
+                    (Some(key), Some(value), Some(expiry_type), Some(expiry_number)) => {
+                        // default to milliseconds
+                        let expiry_number = match expiry_type {
+                            SetExpiry::Ex => expiry_number * 1000,
+                            SetExpiry::Px => expiry_number,
+                        };
+                        data_store.lock().unwrap().insert(key, DataStoreValue{value, created_at: Instant::now(), expired_in: Some(Duration::from_millis(expiry_number))});
+                    },
+                    (Some(key), Some(value), None, None) => {
+                        data_store.lock().unwrap().insert(key, DataStoreValue{value, created_at: Instant::now(), expired_in: None});
                     },
                     _ => println!("no set"),
                 }
@@ -152,8 +192,20 @@ fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, Strin
                 match command_items.get(1) {
                     Some((_pre, key)) => {
                         let key = *key;
-                        if let Some(value) = data_store.lock().unwrap().get(key) {
-                            response = simple_resp(value.as_str());
+                        let mut data_store = data_store.lock().unwrap();
+                        if let Some(value) = data_store.get(key) {
+                            if let (Some(elapsed), Some(expired_in)) = (Instant::now().checked_duration_since(value.created_at), value.expired_in) {
+                                if elapsed.as_millis() >= expired_in.as_millis() {
+                                    data_store.remove(key);
+                                    response = null_resp();
+                                } else {
+                                    let value = value.value.clone();
+                                    response = simple_resp(value.as_str());
+                                }
+                            } else {
+                                let value = value.value.clone();
+                                response = simple_resp(value.as_str());
+                            }
                         } else {
                             response = null_resp();
                         }
