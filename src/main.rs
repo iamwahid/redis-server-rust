@@ -241,7 +241,7 @@ async fn process_repl_connection<'a>(
 ) {
     let command: Vec<_> = client_buffer
         .lines()
-        .map(|r| r.unwrap().replace("\x00", ""))
+        .map(|r| r.unwrap_or("".to_string()).replace("\x00", ""))
         .take_while(|line| !line.is_empty())
         .collect();
     println!("REPL: .. {:?}", command);
@@ -544,7 +544,7 @@ fn process_req(
                         ""
                     }
                 };
-                response = simple_resp("FULLRESYNC <REPL_ID> 0");
+                response = simple_resp("FULLRESYNC 75cd7bc10c49047e0d163660f3b90625b1af31dc 0");
                 println!("PSYNC {} {}", repl_id, repl_offset);
             },
         }
