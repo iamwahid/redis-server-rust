@@ -3,12 +3,21 @@ use std::net::TcpListener;
 use std::io::{BufRead, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::env;
 use tokio::time::{Duration, Instant};
 
 
 fn main() {
     let data_store: Arc<Mutex<HashMap<String, DataStoreValue>>> = Arc::new(Mutex::new(HashMap::new()));
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
+    // parse cli args
+    let args: Vec<_> = env::args().collect();
+    let port = if let Some(port) = args.get(2) {
+        port.parse::<u16>().unwrap()
+    } else {
+        6379
+    };
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
     for stream in listener.incoming() {
         let data_store = data_store.clone();
         let _worker = thread::spawn(
