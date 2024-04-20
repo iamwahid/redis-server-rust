@@ -185,6 +185,18 @@ async fn handle_repl_handshake(client: &mut TcpStream, bind_port: u16) {
                                     .is_ok() 
                                 {
                                     println!("REPL: handshake 2 OK");
+                                    match input_stream.read(&mut client_buffer).await {
+                                        Ok(n) => {
+                                            if n != 0 && output_stream
+                                                .write_all(array_resp(vec!["PSYNC", "?", "-1"]).as_bytes())
+                                                .await
+                                                .is_ok() 
+                                            {
+                                                println!("REPL: handshake 3 OK");
+                                            }
+                                        },
+                                        _ => {}
+                                    }
                                 }
                             },
                             _ => {}
