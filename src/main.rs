@@ -1,24 +1,32 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::io::{BufRead, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::env;
+use std::{env, env::Args};
 use tokio::time::{Duration, Instant};
 
+const DEFAULT_PORT: u16 = 6379;
 
 fn main() {
     let data_store: Arc<Mutex<HashMap<String, DataStoreValue>>> = Arc::new(Mutex::new(HashMap::new()));
     // parse cli args
-    let args: Vec<_> = env::args().collect();
-    let port = if let Some(port) = args.get(2) {
-        port.parse::<u16>().unwrap()
-    } else {
-        6379
-    };
-    let server_repl_config: Arc<ServerReplicationConfig> = Arc::new(ServerReplicationConfig{role: String::from("master")});
+    let parsed = parse_args(env::args());
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
+    let server_repl_config: Arc<Mutex<ServerReplicationConfig>> = Arc::new(Mutex::new(ServerReplicationConfig{role: String::from("master")}));
+    let mut bind_address = format!("127.0.0.1:{}", DEFAULT_PORT);
+    for arg in parsed.into_iter() {
+        match arg {
+            ServerArg::Port(port) => {
+                bind_address = format!("127.0.0.1:{}", port);
+            },
+            ServerArg::ReplicaOf(_host, _port) => {
+                server_repl_config.lock().unwrap().role = String::from("slave");
+            }
+        }
+    }
+
+    let listener = TcpListener::bind(bind_address).unwrap();
     for stream in listener.incoming() {
         let data_store = data_store.clone();
         let server_repl_config = server_repl_config.clone();
@@ -60,6 +68,12 @@ fn bulk_string_resp(message: &str) -> String {
     format!("${}\r\n{}\r\n", message.len(), message)
 }
 
+#[derive(Hash, Eq, PartialEq, Debug)]
+enum ServerArg {
+    Port(u16),
+    ReplicaOf(String, u16),
+}
+
 enum Command {
     Ping,
     Echo,
@@ -84,8 +98,42 @@ struct ServerReplicationConfig {
     role: String,
 }
 
+fn parse_args(args: Args) -> HashSet<ServerArg> {
+    let args: Vec<_> = args.collect();
+    // let parsed 
+    let mut args_iter = args.into_iter();
+    let mut parsed_args: HashSet<ServerArg> = HashSet::new();
+    loop {
+        if let Some(arg) = args_iter.next() {
+            match arg.replace("--", "").as_str() {
+                "port" => {
+                    let port = if let Some(port) = args_iter.next() {
+                        port.parse::<u16>().expect("invalid Port")
+                    } else {
+                        panic!("Port empty");
+                    };
+                    parsed_args.insert(ServerArg::Port(port));
+                },
+                "replicaof" => {
+                    let host = args_iter.next().unwrap();
+                    let port = if let Some(port) = args_iter.next() {
+                        port.parse::<u16>().expect("invalid Port")
+                    } else {
+                        DEFAULT_PORT
+                    };
+                    parsed_args.insert(ServerArg::ReplicaOf(host, port));
+                },
+                _ => ()
+            }
+        } else {
+            break;
+        }
+    }
+    parsed_args
+}
+
 // parse buffer as vector
-fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<ServerReplicationConfig>) -> String {
+fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>) -> String {
     let mut response = simple_resp("");
     let command: Vec<_> = buffer
         .lines()
@@ -206,7 +254,7 @@ fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, DataS
                     (Some(key), Some(value), None, None) => {
                         data_store.lock().unwrap().insert(key, DataStoreValue{value, created_at: Instant::now(), expired_in: None});
                     },
-                    _ => println!("no set"),
+                    _ => (),
                 }
             },
             Command::Get => {
@@ -241,7 +289,7 @@ fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, DataS
                     Some((_pre, info_type)) => {
                         let info_type = *info_type;
                         if info_type.eq("replication") {
-                            response = bulk_string_resp(format!("role:{}", server_repl_config.role).as_str());
+                            response = bulk_string_resp(format!("role:{}", server_repl_config.lock().unwrap().role).as_str());
                         } else {
                             response = null_resp();
                         }
