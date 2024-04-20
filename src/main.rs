@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{stdout, BufRead, Write};
+use std::num::ParseIntError;
 use std::sync::{Arc, Mutex};
 use std::{env, env::Args};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::WriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{Duration, Instant};
+use tokio::time::{self, Duration, Instant};
 
 const DEFAULT_PORT: u16 = 6379;
 
@@ -69,7 +70,7 @@ async fn main() {
         if let Some(ref mut replication_stream) = replication_stream {
             let (input_stream, output_stream) = &mut replication_stream.split();
 
-            let mut client_buffer = [0u8; 1024];
+            let mut client_buffer = [0u8; 512];
             tokio::select! {
                 stream = listener.accept() => {
                     let (stream, _) = stream.unwrap();
@@ -81,6 +82,8 @@ async fn main() {
                             if n != 0 {
                                 // println!("REPL: {:?}", client_buffer);
                                 process_repl_connection(client_buffer, output_stream).await;
+                            } else {
+                                println!("no data");
                             }
                         },
                         Err(_error) => (),
@@ -113,6 +116,19 @@ fn array_resp(messages: Vec<&str>) -> String {
         resp = format!("{}{}", resp, bulk_string_resp(message));
     }
     resp
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
+        .collect()
+}
+
+fn empty_rdb_resp() -> Vec<u8> {
+    let empty_rdb = decode_hex("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2").unwrap();
+    let len = format!("${}\r\n", empty_rdb.len());
+    [len.as_bytes(), &empty_rdb].concat()
 }
 
 #[derive(Hash, Eq, PartialEq, Debug)]
@@ -223,27 +239,30 @@ async fn process_connection(
                 break;
             }
 
-            let response = process_req(&buffer, data_store.clone(), server_repl_config.clone());
+            let responses = process_req(&buffer, data_store.clone(), server_repl_config.clone());
 
-            if stream.write_all(response.as_bytes()).await.is_err() {
-                println!("Error writing to stream");
+            for response in responses.into_iter() {
+                time::sleep(Duration::from_millis(50)).await;
+                if stream.write_all(&response).await.is_err() {
+                    println!("Error writing to stream");
+                }
             }
+
         }
     });
 }
 
 async fn process_repl_connection<'a>(
-    client_buffer: [u8; 1024],
+    client_buffer: [u8; 512],
     _output_stream: &mut WriteHalf<'a>,
 ) {
-    let command: Vec<_> = client_buffer
-        .lines()
-        .map(|r| r.unwrap_or("".to_string()).replace("\x00", ""))
-        .take_while(|line| !line.is_empty())
-        .collect();
-    println!("REPL: .. {:?}", command);
-    // output_stream.write("user_buffer".as_bytes()).await.unwrap();
-    // output_stream.flush().await.unwrap();
+    println!("REPL: buffer {:?}", client_buffer);
+    // let command: Vec<_> = client_buffer
+    //     .to_vec()
+    //     .lines()
+    //     .map(|r| r.unwrap().replace("\x00", ""))
+    //     .take_while(|line| !line.is_empty())
+    //     .collect();
 }
 
 fn parse_args(args: Args) -> HashSet<ServerArg> {
@@ -285,8 +304,9 @@ fn process_req(
     &buffer: &[u8; 1024],
     data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>,
     server_repl_config: Arc<Mutex<ServerReplicationConfig>>,
-) -> String {
+) -> Vec<Vec<u8>> {
     let mut response = simple_resp("");
+    let mut should_send_repl_init = false;
     let command: Vec<_> = buffer
         .lines()
         .map(|r| r.unwrap().replace("\x00", ""))
@@ -510,6 +530,7 @@ fn process_req(
                 let repl_config = server_repl_config.lock().unwrap();
                 let repl_id = if let Some(repl_id) = command_items.get(1) {
                     if repl_id.1.to_ascii_lowercase().as_str() == "?" {
+                        should_send_repl_init = true;
                         Some(repl_config.master_replid.clone())
                     } else {
                         Some(repl_id.1.to_string())
@@ -520,6 +541,7 @@ fn process_req(
 
                 let repl_offset = if let Some(repl_offset) = command_items.get(2) {
                     if repl_offset.1.to_ascii_lowercase().as_str() == "-1" {
+                        should_send_repl_init = should_send_repl_init && true;
                         Some(format!("{}", repl_config.master_repl_offset))
                     } else {
                         Some(repl_offset.1.clone())
@@ -535,5 +557,10 @@ fn process_req(
         }
     }
 
-    response
+    let mut responses = Vec::with_capacity(2);
+    responses.push(response.as_bytes().to_vec());
+    if should_send_repl_init {
+        responses.push(empty_rdb_resp());
+    }
+    responses
 }
