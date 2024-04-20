@@ -78,10 +78,7 @@ async fn main() {
                 repl_buffer = input_stream.read(&mut client_buffer) => {
                     match repl_buffer {
                         Ok(n) => {
-                            if n == 0 {
-                                println!("REPL: master disconnected!");
-                                break;
-                            } else {
+                            if n != 0 {
                                 // println!("REPL: {:?}", client_buffer);
                                 process_repl_connection(client_buffer, output_stream).await;
                             }
