@@ -16,10 +16,12 @@ fn main() {
     } else {
         6379
     };
+    let server_repl_config: Arc<ServerReplicationConfig> = Arc::new(ServerReplicationConfig{role: String::from("master")});
 
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
     for stream in listener.incoming() {
         let data_store = data_store.clone();
+        let server_repl_config = server_repl_config.clone();
         let _worker = thread::spawn(
             move || {
                 match stream {
@@ -30,7 +32,7 @@ fn main() {
                             break;
                         }
 
-                        let response = process_req(&buffer, data_store.clone());
+                        let response = process_req(&buffer, data_store.clone(), server_repl_config.clone());
 
                         if stream.write_all(response.as_bytes()).is_err() {
                             println!("Error writing to stream");
@@ -54,11 +56,16 @@ fn null_resp() -> String {
     format!("$-1\r\n")
 }
 
+fn bulk_string_resp(message: &str) -> String {
+    format!("${}\r\n{}\r\n", message.len(), message)
+}
+
 enum Command {
     Ping,
     Echo,
     Set,
     Get,
+    Info,
 }
 
 #[derive(Debug)]
@@ -73,8 +80,12 @@ struct DataStoreValue {
     expired_in: Option<Duration>,
 }
 
+struct ServerReplicationConfig {
+    role: String,
+}
+
 // parse buffer as vector
-fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>) -> String {
+fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<ServerReplicationConfig>) -> String {
     let mut response = simple_resp("");
     let command: Vec<_> = buffer
         .lines()
@@ -120,6 +131,7 @@ fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, DataS
                 "echo" => Some(Command::Echo),
                 "set" => Some(Command::Set),
                 "get" => Some(Command::Get),
+                "info" => Some(Command::Info),
                 _ => None,
             }
         },
@@ -130,6 +142,9 @@ fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, DataS
 
     if let Some(command) = command {
         match command {
+            Command::Ping => {
+                response = simple_resp("PONG");
+            },
             Command::Echo => {
                 match command_items.get(1) {
                     Some((_pre, message)) => {
@@ -140,9 +155,6 @@ fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, DataS
                         println!("no message");
                     }
                 };
-            },
-            Command::Ping => {
-                response = simple_resp("PONG");
             },
             Command::Set => {
                 response = simple_resp("OK");
@@ -221,6 +233,21 @@ fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, DataS
                     },
                     None => {
                         response = null_resp();
+                    }
+                };
+            },
+            Command::Info => {
+                match command_items.get(1) {
+                    Some((_pre, info_type)) => {
+                        let info_type = *info_type;
+                        if info_type.eq("replication") {
+                            response = bulk_string_resp(format!("role:{}", server_repl_config.role).as_str());
+                        } else {
+                            response = null_resp();
+                        }
+                    },
+                    None => {
+                        println!("no message");
                     }
                 };
             }
