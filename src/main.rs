@@ -24,11 +24,11 @@ async fn main() {
         ..ServerReplicationConfig::default()
     };
 
-    let mut bind_address = format!("127.0.0.1:{}", DEFAULT_PORT);
+    let mut bind_address = ("127.0.0.1", DEFAULT_PORT);
     for arg in parsed.into_iter() {
         match arg {
             ServerArg::Port(port) => {
-                bind_address = format!("127.0.0.1:{}", port);
+                bind_address.1 = port;
             }
             ServerArg::ReplicaOf(host, port) => {
                 server_repl_config.role = String::from("slave");
@@ -49,30 +49,8 @@ async fn main() {
             let mut client = TcpStream::connect((master_host.clone(), master_port))
                 .await
                 .expect("Failed to connect Master");
-            // connection handshake
-            let (input_stream, output_stream) = &mut client.split();
-            if output_stream
-                .write_all(array_resp(vec!["PING".to_string()]).as_bytes())
-                .await
-                .is_ok()
-            {
-                let mut client_buffer = [0u8; 512];
-                match input_stream.read(&mut client_buffer).await {
-                    Ok(n) => {
-                        if n == 0 {
-                            println!("REPL: PING Failed!");
-                        } else {
-                            println!("REPL: Replication connected!");
-                            // stdout().write(&client_buffer).unwrap();
-                            // stdout().flush().unwrap();
-                        }
-                    }
-                    Err(_error) => (),
-                }
-            } else {
-                println!("REPL: replication connection failed!");
-            }
-
+            // handle handshake
+            handle_repl_handshake(&mut client, bind_address.1).await;
             Some(client)
         } else {
             None
@@ -104,7 +82,7 @@ async fn main() {
                                 println!("REPL: master disconnected!");
                                 break;
                             } else {
-                                println!("REPL: {:?}", client_buffer);
+                                // println!("REPL: {:?}", client_buffer);
                                 process_repl_connection(client_buffer, output_stream).await;
                             }
                         },
@@ -132,10 +110,10 @@ fn bulk_string_resp(message: &str) -> String {
     format!("${}\r\n{}\r\n", message.len(), message)
 }
 
-fn array_resp(messages: Vec<String>) -> String {
+fn array_resp(messages: Vec<&str>) -> String {
     let mut resp = format!("*{}\r\n", messages.len());
     for message in messages.into_iter() {
-        resp = format!("{}{}", resp, bulk_string_resp(message.as_str()));
+        resp = format!("{}{}", resp, bulk_string_resp(message));
     }
     resp
 }
@@ -153,6 +131,7 @@ enum Command {
     Set,
     Get,
     Info,
+    Replconf,
 }
 
 #[derive(Debug)]
@@ -174,6 +153,49 @@ struct ServerReplicationConfig {
     master_repl_offset: u8,
     master_host: Option<String>,
     master_port: Option<u16>,
+}
+
+async fn handle_repl_handshake(client: &mut TcpStream, bind_port: u16) {
+    // connection handshake 1
+    let (input_stream, output_stream) = &mut client.split();
+    if output_stream
+        .write_all(array_resp(vec!["PING"]).as_bytes())
+        .await
+        .is_ok()
+    {
+        let mut client_buffer = [0u8; 512];
+        match input_stream.read(&mut client_buffer).await {
+            Ok(n) => {
+                if n == 0 {
+                    println!("REPL: PING Failed!");
+                } else {
+                    println!("REPL: Replication connected!");
+                    // send handshake 2
+                    if output_stream
+                        .write_all(array_resp(vec!["REPLCONF", "listening-port", format!("{}", bind_port).as_str()]).as_bytes())
+                        .await
+                        .is_ok() 
+                    {
+                        match input_stream.read(&mut client_buffer).await {
+                            Ok(n) => {
+                                if n != 0 && output_stream
+                                    .write_all(array_resp(vec!["REPLCONF", "capa", "psync2"]).as_bytes())
+                                    .await
+                                    .is_ok() 
+                                {
+                                    println!("REPL: handshake 2 OK");
+                                }
+                            },
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Err(_error) => (),
+        }
+    } else {
+        println!("REPL: replication connection failed!");
+    }
 }
 
 async fn process_connection(
@@ -201,16 +223,22 @@ async fn process_connection(
 }
 
 async fn process_repl_connection<'a>(
-    mut _client_buffer: [u8; 1024],
-    output_stream: &mut WriteHalf<'a>,
+    client_buffer: [u8; 1024],
+    _output_stream: &mut WriteHalf<'a>,
 ) {
-    output_stream.write("user_buffer".as_bytes()).await.unwrap();
-    output_stream.flush().await.unwrap();
+    let command: Vec<_> = client_buffer
+        .lines()
+        .map(|r| r.unwrap().replace("\x00", ""))
+        .take_while(|line| !line.is_empty())
+        .collect();
+    println!("REPL: .. {:?}", command);
+    // output_stream.write("user_buffer".as_bytes()).await.unwrap();
+    // output_stream.flush().await.unwrap();
 }
 
 fn parse_args(args: Args) -> HashSet<ServerArg> {
     let args: Vec<_> = args.collect();
-    // let parsed
+
     let mut args_iter = args.into_iter();
     let mut parsed_args: HashSet<ServerArg> = HashSet::new();
     loop {
@@ -295,6 +323,7 @@ fn process_req(
                 "set" => Some(Command::Set),
                 "get" => Some(Command::Get),
                 "info" => Some(Command::Info),
+                "replconf" => Some(Command::Replconf),
                 _ => None,
             }
         }
@@ -434,6 +463,38 @@ fn process_req(
                     }
                 };
             }
+            Command::Replconf => {
+                let conf_key = match command_items.get(1) {
+                    Some((_pre, conf_key)) => {
+                        let conf_key = *conf_key;
+                        match conf_key.to_ascii_lowercase().as_str() {
+                            "listening-port" => {
+                                response = simple_resp("OK");
+                            },
+                            "capa" => {
+                                response = simple_resp("OK");
+                            },
+                            _ => {
+                                response = null_resp();
+                            }
+                        }
+                        conf_key
+                    }
+                    None => {
+                        ""
+                    }
+                };
+                let conf_value = match command_items.get(2) {
+                    Some((_pre, replconf_type)) => {
+                        let replconf_type = *replconf_type;
+                        replconf_type
+                    }
+                    None => {
+                        ""
+                    }
+                };
+                println!("REPLCONF {} {}", conf_key, conf_value);
+            },
         }
     }
 
