@@ -1,11 +1,15 @@
+use std::collections::HashMap;
 use std::net::TcpListener;
 use std::io::{BufRead, Read, Write};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 
 fn main() {
+    let data_store: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
     for stream in listener.incoming() {
+        let data_store = data_store.clone();
         let _worker = thread::spawn(
             move || {
                 match stream {
@@ -16,9 +20,9 @@ fn main() {
                             break;
                         }
 
-                        let response = parse_req(&buffer);
+                        let response = process_req(&buffer, data_store.clone());
 
-                        if stream.write_all(simple_resp(&response).as_bytes()).is_err() {
+                        if stream.write_all(response.as_bytes()).is_err() {
                             println!("Error writing to stream");
                         }
                     }
@@ -35,14 +39,21 @@ fn simple_resp(message: &str) -> String {
     format!("+{}\r\n", message)
 }
 
+fn null_resp() -> String {
+    // null bulk string response
+    format!("$-1\r\n")
+}
+
 enum Command {
     Ping,
     Echo,
+    Set,
+    Get,
 }
 
 // parse buffer as vector
-fn parse_req(&buffer: &[u8; 1024]) -> String {
-    let mut response = String::from("");
+fn process_req(&buffer: &[u8; 1024], data_store: Arc<Mutex<HashMap<String, String>>>) -> String {
+    let mut response = simple_resp("");
     let command: Vec<_> = buffer
         .lines()
         .map(|r| r.unwrap().replace("\x00", ""))
@@ -82,9 +93,11 @@ fn parse_req(&buffer: &[u8; 1024]) -> String {
     let command : Option<Command> = match command_items.get(0) {
         Some((_pre, command)) => {
             let command = *command;
-            match command.clone().as_str() {
+            match command.clone().to_ascii_lowercase().as_str() {
                 "ping" => Some(Command::Ping),
                 "echo" => Some(Command::Echo),
+                "set" => Some(Command::Set),
+                "get" => Some(Command::Get),
                 _ => None,
             }
         },
@@ -100,7 +113,7 @@ fn parse_req(&buffer: &[u8; 1024]) -> String {
                     Some((_pre, message)) => {
                         let message = *message;
                         println!("{}", message);
-                        response = message.clone();
+                        response = simple_resp(message.as_str());
                     },
                     None => {
                         println!("no message");
@@ -108,8 +121,48 @@ fn parse_req(&buffer: &[u8; 1024]) -> String {
                 };
             },
             Command::Ping => {
-                response = String::from("PONG");
+                response = simple_resp("PONG");
             },
+            Command::Set => {
+                response = simple_resp("OK");
+                let key = match command_items.get(1) {
+                    Some((_pre, message)) => {
+                        let message = *message;
+                        println!("key {}", message);
+                        Some(message.clone())
+                    },
+                    None => None
+                };
+                let value = match command_items.get(2) {
+                    Some((_pre, message)) => {
+                        let message = *message;
+                        println!("value {}", message);
+                        Some(message.clone())
+                    },
+                    None => None
+                };
+                match (key, value) {
+                    (Some(key), Some(value)) => {
+                        data_store.lock().unwrap().insert(key, value);
+                    },
+                    _ => println!("no set"),
+                }
+            },
+            Command::Get => {
+                match command_items.get(1) {
+                    Some((_pre, key)) => {
+                        let key = *key;
+                        if let Some(value) = data_store.lock().unwrap().get(key) {
+                            response = simple_resp(value.as_str());
+                        } else {
+                            response = null_resp();
+                        }
+                    },
+                    None => {
+                        response = null_resp();
+                    }
+                };
+            }
         }
     }
 
