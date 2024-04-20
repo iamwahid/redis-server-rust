@@ -81,11 +81,10 @@ async fn main() {
                             if n == 0 {
                                 println!("REPL: master disconnected!");
                                 break;
+                            } else {
+                                // println!("REPL: {:?}", client_buffer);
+                                process_repl_connection(client_buffer, output_stream).await;
                             }
-                            //  else {
-                            //     // println!("REPL: {:?}", client_buffer);
-                            //     // process_repl_connection(client_buffer, output_stream).await;
-                            // }
                         },
                         Err(_error) => (),
                     }
@@ -237,18 +236,17 @@ async fn process_connection(
 }
 
 async fn process_repl_connection<'a>(
-    _client_buffer: [u8; 1024],
+    client_buffer: [u8; 1024],
     _output_stream: &mut WriteHalf<'a>,
 ) {
-    // let command: Vec<_> = client_buffer
-    //     .lines()
-    //     .map(|r| r.unwrap().replace("\x00", ""))
-    //     .take_while(|line| !line.is_empty())
-    //     .collect();
-    // println!("REPL: .. {:?}", command);
+    let command: Vec<_> = client_buffer
+        .lines()
+        .map(|r| r.unwrap().replace("\x00", ""))
+        .take_while(|line| !line.is_empty())
+        .collect();
+    println!("REPL: .. {:?}", command);
     // output_stream.write("user_buffer".as_bytes()).await.unwrap();
     // output_stream.flush().await.unwrap();
-    todo!();
 }
 
 fn parse_args(args: Args) -> HashSet<ServerArg> {
