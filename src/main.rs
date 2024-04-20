@@ -236,17 +236,18 @@ async fn process_connection(
 }
 
 async fn process_repl_connection<'a>(
-    client_buffer: [u8; 1024],
+    _client_buffer: [u8; 1024],
     _output_stream: &mut WriteHalf<'a>,
 ) {
-    let command: Vec<_> = client_buffer
-        .lines()
-        .map(|r| r.unwrap().replace("\x00", ""))
-        .take_while(|line| !line.is_empty())
-        .collect();
-    println!("REPL: .. {:?}", command);
+    // let command: Vec<_> = client_buffer
+    //     .lines()
+    //     .map(|r| r.unwrap().replace("\x00", ""))
+    //     .take_while(|line| !line.is_empty())
+    //     .collect();
+    // println!("REPL: .. {:?}", command);
     // output_stream.write("user_buffer".as_bytes()).await.unwrap();
     // output_stream.flush().await.unwrap();
+    todo!();
 }
 
 fn parse_args(args: Args) -> HashSet<ServerArg> {
