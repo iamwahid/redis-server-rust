@@ -132,6 +132,7 @@ enum Command {
     Get,
     Info,
     Replconf,
+    Psync,
 }
 
 #[derive(Debug)]
@@ -324,6 +325,7 @@ fn process_req(
                 "get" => Some(Command::Get),
                 "info" => Some(Command::Info),
                 "replconf" => Some(Command::Replconf),
+                "psync" => Some(Command::Psync),
                 _ => None,
             }
         }
@@ -494,6 +496,44 @@ fn process_req(
                     }
                 };
                 println!("REPLCONF {} {}", conf_key, conf_value);
+            },
+            Command::Psync => {
+                let repl_id = match command_items.get(1) {
+                    Some((_pre, repl_id)) => {
+                        let repl_id = *repl_id;
+                        match repl_id.to_ascii_lowercase().as_str() {
+                            "?" => {
+                                response = simple_resp("OK");
+                            },
+                            _ => {
+                                response = null_resp();
+                            }
+                        }
+                        repl_id
+                    }
+                    None => {
+                        ""
+                    }
+                };
+                let repl_offset = match command_items.get(2) {
+                    Some((_pre, repl_offset)) => {
+                        let repl_offset = *repl_offset;
+                        match repl_offset.to_ascii_lowercase().as_str() {
+                            "-1" => {
+                                response = simple_resp("OK");
+                            },
+                            _ => {
+                                response = null_resp();
+                            }
+                        }
+                        repl_offset
+                    }
+                    None => {
+                        ""
+                    }
+                };
+                response = simple_resp("FULLRESYNC <REPL_ID> 0");
+                println!("PSYNC {} {}", repl_id, repl_offset);
             },
         }
     }
