@@ -519,7 +519,7 @@ fn process_req(
                 };
 
                 let repl_offset = if let Some(repl_offset) = command_items.get(2) {
-                    if repl_offset.1.to_ascii_lowercase().as_str() == "0" {
+                    if repl_offset.1.to_ascii_lowercase().as_str() == "-1" {
                         Some(format!("{}", repl_config.master_repl_offset))
                     } else {
                         Some(repl_offset.1.clone())
