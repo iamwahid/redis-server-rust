@@ -507,42 +507,30 @@ fn process_req(
                 println!("REPLCONF {} {}", conf_key, conf_value);
             },
             Command::Psync => {
-                let repl_id = match command_items.get(1) {
-                    Some((_pre, repl_id)) => {
-                        let repl_id = *repl_id;
-                        match repl_id.to_ascii_lowercase().as_str() {
-                            "?" => {
-                                response = simple_resp("OK");
-                            },
-                            _ => {
-                                response = null_resp();
-                            }
-                        }
-                        repl_id
+                let repl_config = server_repl_config.lock().unwrap();
+                let repl_id = if let Some(repl_id) = command_items.get(1) {
+                    if repl_id.1.to_ascii_lowercase().as_str() == "?" {
+                        Some(repl_config.master_replid.clone())
+                    } else {
+                        Some(repl_id.1.to_string())
                     }
-                    None => {
-                        ""
-                    }
+                } else {
+                    None
                 };
-                let repl_offset = match command_items.get(2) {
-                    Some((_pre, repl_offset)) => {
-                        let repl_offset = *repl_offset;
-                        match repl_offset.to_ascii_lowercase().as_str() {
-                            "-1" => {
-                                response = simple_resp("OK");
-                            },
-                            _ => {
-                                response = null_resp();
-                            }
-                        }
-                        repl_offset
+
+                let repl_offset = if let Some(repl_offset) = command_items.get(1) {
+                    if repl_offset.1.to_ascii_lowercase().as_str() == "0" {
+                        Some(format!("{}", repl_config.master_repl_offset))
+                    } else {
+                        Some(repl_offset.1.clone())
                     }
-                    None => {
-                        ""
-                    }
+                } else {
+                    None
                 };
-                response = simple_resp("FULLRESYNC 75cd7bc10c49047e0d163660f3b90625b1af31dc 0");
-                println!("PSYNC {} {}", repl_id, repl_offset);
+
+                if let (Some(repl_id), Some(repl_offset)) = (repl_id, repl_offset) {
+                    response = simple_resp(format!("FULLRESYNC {} {}", repl_id, repl_offset).as_str());
+                }
             },
         }
     }
