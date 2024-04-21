@@ -82,8 +82,6 @@ async fn main() {
                             if n != 0 {
                                 // println!("REPL: {:?}", client_buffer);
                                 process_repl_connection(client_buffer, output_stream).await;
-                            } else {
-                                println!("no data");
                             }
                         },
                         Err(_error) => (),
