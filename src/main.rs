@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{stdout, BufRead, Write};
+use std::io::BufRead;
+use std::net::SocketAddr;
 use std::num::ParseIntError;
 use std::sync::{Arc, Mutex};
 use std::{env, env::Args};
@@ -73,14 +74,14 @@ async fn main() {
             let mut client_buffer = [0u8; 512];
             tokio::select! {
                 stream = listener.accept() => {
-                    let (stream, _) = stream.unwrap();
-                    process_connection(stream, data_store.clone(), server_repl_config.clone()).await;
+                    let (stream, client) = stream.unwrap();
+                    process_connection(client, stream, data_store.clone(), server_repl_config.clone()).await;
                 },
                 repl_buffer = input_stream.read(&mut client_buffer) => {
+                    // receive replication
                     match repl_buffer {
                         Ok(n) => {
                             if n != 0 {
-                                // println!("REPL: {:?}", client_buffer);
                                 process_repl_connection(client_buffer, output_stream).await;
                             }
                         },
@@ -89,14 +90,29 @@ async fn main() {
                 }
             }
         } else {
-            let (stream, _) = listener.accept().await.unwrap();
-            process_connection(stream, data_store.clone(), server_repl_config.clone()).await;
+            let (stream, client) = listener.accept().await.unwrap();
+            println!("from client {:?}", client);
+            process_connection(
+                client,
+                stream,
+                data_store.clone(),
+                server_repl_config.clone(),
+            )
+            .await;
         }
     }
 }
 
 fn simple_resp(message: &str) -> String {
     format!("+{}\r\n", message)
+}
+
+fn simple_error_resp(message: &str) -> String {
+    format!("-{}\r\n", message)
+}
+
+fn arg_error_resp(command: &str) -> String {
+    simple_error_resp(format!("ERR wrong number of arguments for '{}' command", command).as_str())
 }
 
 fn null_resp() -> String {
@@ -138,12 +154,12 @@ enum ServerArg {
 #[derive(Debug)]
 enum Command {
     Ping,
-    Echo,
-    Set,
-    Get,
-    Info,
-    Replconf,
-    Psync,
+    Echo(Vec<(String, String)>),
+    Set(Vec<(String, String)>),
+    Get(Vec<(String, String)>),
+    Info(Vec<(String, String)>),
+    Replconf(Vec<(String, String)>),
+    Psync(Vec<(String, String)>),
 }
 
 #[derive(Debug)]
@@ -167,68 +183,70 @@ struct ServerReplicationConfig {
     master_port: Option<u16>,
 }
 
+#[derive(Default, Debug)]
+struct ResponseContext {
+    responses: Vec<Vec<u8>>,
+    add_repl_client: bool,
+}
+
 async fn handle_repl_handshake(client: &mut TcpStream, bind_port: u16) {
-    // connection handshake 1
+    // connection handshake
     let (input_stream, output_stream) = &mut client.split();
-    if output_stream
+    let mut stage = 1;
+    let mut client_buffer = [0u8; 512];
+    // send PING
+    output_stream
         .write_all(array_resp(vec!["PING"]).as_bytes())
         .await
-        .is_ok()
-    {
-        let mut client_buffer = [0u8; 512];
+        .unwrap();
+
+    let bind_port = format!("{}", bind_port);
+    let handshakes: HashMap<i32, Vec<&str>> = HashMap::from_iter([
+        (2, vec!["REPLCONF", "listening-port", bind_port.as_str()]),
+        (3, vec!["REPLCONF", "capa", "psync2"]),
+        (4, vec!["PSYNC", "?", "-1"]),
+    ]);
+    loop {
         match input_stream.read(&mut client_buffer).await {
-            Ok(n) => {
-                if n == 0 {
-                    println!("REPL: PING Failed!");
-                } else {
-                    println!("REPL: Replication connected!");
-                    // send handshake 2
-                    if output_stream
-                        .write_all(array_resp(vec!["REPLCONF", "listening-port", format!("{}", bind_port).as_str()]).as_bytes())
+            Ok(read_count) => {
+                if read_count != 0 {
+                    match stage {
+                        1 => stage = 2,
+                        2 => stage = 3,
+                        3 => stage = 4,
+                        _ => break,
+                    };
+                    output_stream
+                        .write_all(array_resp(handshakes.get(&stage).unwrap().clone()).as_bytes())
                         .await
-                        .is_ok() 
-                    {
-                        match input_stream.read(&mut client_buffer).await {
-                            Ok(n) => {
-                                if n != 0 && output_stream
-                                    .write_all(array_resp(vec!["REPLCONF", "capa", "psync2"]).as_bytes())
-                                    .await
-                                    .is_ok() 
-                                {
-                                    println!("REPL: handshake 2 OK");
-                                    match input_stream.read(&mut client_buffer).await {
-                                        Ok(n) => {
-                                            if n != 0 && output_stream
-                                                .write_all(array_resp(vec!["PSYNC", "?", "-1"]).as_bytes())
-                                                .await
-                                                .is_ok() 
-                                            {
-                                                println!("REPL: handshake 3 OK");
-                                            }
-                                        },
-                                        _ => {}
-                                    }
-                                }
-                            },
-                            _ => {}
-                        }
+                        .unwrap();
+                    if stage == 4 {
+                        break;
                     }
+                } else {
+                    println!("No reply");
+                    break;
                 }
             }
-            Err(_error) => (),
+            Err(_) => {
+                break;
+            }
         }
-    } else {
-        println!("REPL: replication connection failed!");
     }
+    println!("Entering replica output mode...  (press Ctrl-C to quit)");
 }
 
 async fn process_connection(
+    client: SocketAddr,
     mut stream: TcpStream,
     data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>,
     server_repl_config: Arc<Mutex<ServerReplicationConfig>>,
 ) {
     let data_store = data_store.clone();
     let server_repl_config = server_repl_config.clone();
+
+    // determine if it replication connection
+
     let _worker = tokio::spawn(async move {
         loop {
             let mut buffer = [0; 1024];
@@ -237,30 +255,42 @@ async fn process_connection(
                 break;
             }
 
-            let responses = process_req(&buffer, data_store.clone(), server_repl_config.clone());
+            let command = parse_req(&buffer);
+            if let Some(command) = command {
+                let context =
+                    process_command(command, data_store.clone(), server_repl_config.clone());
+                for response in context.responses.into_iter() {
+                    time::sleep(Duration::from_millis(50)).await;
+                    if stream.write_all(&response).await.is_err() {
+                        println!("Error writing to stream");
+                    }
+                }
 
-            for response in responses.into_iter() {
-                time::sleep(Duration::from_millis(50)).await;
-                if stream.write_all(&response).await.is_err() {
-                    println!("Error writing to stream");
+                if context.add_repl_client {
+                    println!("replication client {:?}", client);
+                    // move process in new thread
                 }
             }
-
         }
     });
 }
 
-async fn process_repl_connection<'a>(
-    client_buffer: [u8; 512],
-    _output_stream: &mut WriteHalf<'a>,
-) {
-    println!("REPL: buffer {:?}", client_buffer);
-    // let command: Vec<_> = client_buffer
-    //     .to_vec()
-    //     .lines()
-    //     .map(|r| r.unwrap().replace("\x00", ""))
-    //     .take_while(|line| !line.is_empty())
-    //     .collect();
+async fn process_repl_connection<'a>(client_buffer: [u8; 512], _output_stream: &mut WriteHalf<'a>) {
+    let command = client_buffer
+        .to_vec()
+        .into_iter()
+        .map(|r| r as char)
+        .collect::<String>();
+    if command.starts_with("+FULLRESYNC") {
+        print!("PSYNC replied {}", command);
+    } else if command.starts_with("$") && !command.ends_with("\r\n") {
+        let len: Vec<_> = command.split("\r\n").into_iter().collect();
+        println!(
+            "Full resync with master, discarding {} bytes of bulk transfer...",
+            len.first().unwrap().replace("$", "")
+        );
+        println!("Full resync done. Logging commands from master.");
+    }
 }
 
 fn parse_args(args: Args) -> HashSet<ServerArg> {
@@ -298,13 +328,7 @@ fn parse_args(args: Args) -> HashSet<ServerArg> {
 }
 
 // parse buffer as vector
-fn process_req(
-    &buffer: &[u8; 1024],
-    data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>,
-    server_repl_config: Arc<Mutex<ServerReplicationConfig>>,
-) -> Vec<Vec<u8>> {
-    let mut response = simple_resp("");
-    let mut should_send_repl_init = false;
+fn parse_req(&buffer: &[u8; 1024]) -> Option<Command> {
     let command: Vec<_> = buffer
         .lines()
         .map(|r| r.unwrap().replace("\x00", ""))
@@ -332,7 +356,7 @@ fn process_req(
             command.get(offset as usize + 1),
         ) {
             (Some(com1), Some(com2)) => {
-                command_items.push((com1, com2));
+                command_items.push((com1.clone(), com2.clone()));
             }
             _ => {
                 break;
@@ -344,221 +368,194 @@ fn process_req(
     // parse command
     let command: Option<Command> = match command_items.get(0) {
         Some((_pre, command)) => {
-            let command = *command;
-            match command.clone().to_ascii_lowercase().as_str() {
+            let com_args = command_items[1..].to_vec();
+            match command.to_ascii_lowercase().as_str() {
                 "ping" => Some(Command::Ping),
-                "echo" => Some(Command::Echo),
-                "set" => Some(Command::Set),
-                "get" => Some(Command::Get),
-                "info" => Some(Command::Info),
-                "replconf" => Some(Command::Replconf),
-                "psync" => Some(Command::Psync),
+                "echo" => Some(Command::Echo(com_args)),
+                "set" => Some(Command::Set(com_args)),
+                "get" => Some(Command::Get(com_args)),
+                "info" => Some(Command::Info(com_args)),
+                "replconf" => Some(Command::Replconf(com_args)),
+                "psync" => Some(Command::Psync(com_args)),
                 _ => None,
             }
         }
         None => None,
     };
 
-    if let Some(command) = command {
-        match command {
-            Command::Ping => {
-                response = simple_resp("PONG");
-            }
-            Command::Echo => {
-                match command_items.get(1) {
-                    Some((_pre, message)) => {
-                        let message = *message;
-                        response = simple_resp(message.as_str());
-                    }
-                    None => {
-                        println!("no message");
-                    }
-                };
-            }
-            Command::Set => {
-                response = simple_resp("OK");
-                let key = match command_items.get(1) {
-                    Some((_pre, message)) => {
-                        let message = *message;
-                        Some(message.clone())
-                    }
-                    None => None,
-                };
-                let value = match command_items.get(2) {
-                    Some((_pre, message)) => {
-                        let message = *message;
-                        Some(message.clone())
-                    }
-                    None => None,
-                };
-                let expiry_type = match command_items.get(3) {
-                    Some((_pre, command)) => {
-                        let command = *command;
-                        match command.to_ascii_lowercase().as_str() {
-                            "ex" => Some(SetExpiry::Ex),
-                            "px" => Some(SetExpiry::Px),
-                            _ => None,
-                        }
-                    }
-                    None => None,
-                };
-                let expiry_number = match command_items.get(4) {
-                    Some((_pre, expiry)) => {
-                        let expiry = *expiry;
-                        Some(expiry.clone().parse::<u64>().unwrap_or(0))
-                    }
-                    None => None,
-                };
-                match (key, value, expiry_type, expiry_number) {
-                    (Some(key), Some(value), Some(expiry_type), Some(expiry_number)) => {
-                        // default to milliseconds
-                        let expiry_number = match expiry_type {
-                            SetExpiry::Ex => expiry_number * 1000,
-                            SetExpiry::Px => expiry_number,
-                        };
-                        data_store.lock().unwrap().insert(
-                            key,
-                            DataStoreValue {
-                                value,
-                                created_at: Instant::now(),
-                                expired_in: Some(Duration::from_millis(expiry_number)),
-                            },
-                        );
-                    }
-                    (Some(key), Some(value), None, None) => {
-                        data_store.lock().unwrap().insert(
-                            key,
-                            DataStoreValue {
-                                value,
-                                created_at: Instant::now(),
-                                expired_in: None,
-                            },
-                        );
-                    }
-                    _ => (),
+    command
+}
+
+fn process_command(
+    command: Command,
+    data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>,
+    server_repl_config: Arc<Mutex<ServerReplicationConfig>>,
+) -> ResponseContext {
+    let mut should_send_repl_init = false;
+    let mut add_repl_client = false;
+    let response = match command {
+        Command::Ping => {
+            simple_resp("PONG")
+        }
+        Command::Echo(com_args) => {
+            match com_args.get(0) {
+                Some((_pre, message)) => {
+                    simple_resp(message.as_str())
+                }
+                None => {
+                    arg_error_resp("echo")
                 }
             }
-            Command::Get => {
-                match command_items.get(1) {
-                    Some((_pre, key)) => {
-                        let key = *key;
-                        let mut data_store = data_store.lock().unwrap();
-                        if let Some(value) = data_store.get(key) {
-                            if let (Some(elapsed), Some(expired_in)) = (
-                                Instant::now().checked_duration_since(value.created_at),
-                                value.expired_in,
-                            ) {
-                                if elapsed.as_millis() >= expired_in.as_millis() {
-                                    data_store.remove(key);
-                                    response = null_resp();
-                                } else {
-                                    let value = value.value.clone();
-                                    response = simple_resp(value.as_str());
-                                }
+        }
+        Command::Set(com_args) => {
+            let key = match com_args.get(0) {
+                Some((_pre, message)) => Some(message.clone()),
+                None => None,
+            };
+            let value = match com_args.get(1) {
+                Some((_pre, message)) => Some(message.clone()),
+                None => None,
+            };
+            let expiry_type = match com_args.get(2) {
+                Some((_pre, command)) => match command.to_ascii_lowercase().as_str() {
+                    "ex" => Some(SetExpiry::Ex),
+                    "px" => Some(SetExpiry::Px),
+                    _ => None,
+                },
+                None => None,
+            };
+            let expiry_number = match com_args.get(3) {
+                Some((_pre, expiry)) => Some(expiry.clone().parse::<u64>().unwrap_or(0)),
+                None => None,
+            };
+            match (key, value, expiry_type, expiry_number) {
+                (Some(key), Some(value), Some(expiry_type), Some(expiry_number)) => {
+                    // default to milliseconds
+                    let expiry_number = match expiry_type {
+                        SetExpiry::Ex => expiry_number * 1000,
+                        SetExpiry::Px => expiry_number,
+                    };
+                    data_store.lock().unwrap().insert(
+                        key,
+                        DataStoreValue {
+                            value,
+                            created_at: Instant::now(),
+                            expired_in: Some(Duration::from_millis(expiry_number)),
+                        },
+                    );
+                    simple_resp("OK")
+                }
+                (Some(key), Some(value), None, None) => {
+                    data_store.lock().unwrap().insert(
+                        key,
+                        DataStoreValue {
+                            value,
+                            created_at: Instant::now(),
+                            expired_in: None,
+                        },
+                    );
+                    simple_resp("OK")
+                }
+                _ => {
+                    arg_error_resp("set")
+                }
+            }
+        }
+        Command::Get(com_args) => {
+            match com_args.get(0) {
+                Some((_pre, key)) => {
+                    let mut data_store = data_store.lock().unwrap();
+                    if let Some(value) = data_store.get(key) {
+                        if let (Some(elapsed), Some(expired_in)) = (
+                            Instant::now().checked_duration_since(value.created_at),
+                            value.expired_in,
+                        ) {
+                            if elapsed.as_millis() >= expired_in.as_millis() {
+                                data_store.remove(key);
+                                null_resp()
                             } else {
                                 let value = value.value.clone();
-                                response = simple_resp(value.as_str());
+                                simple_resp(value.as_str())
                             }
                         } else {
-                            response = null_resp();
+                            let value = value.value.clone();
+                            simple_resp(value.as_str())
                         }
-                    }
-                    None => {
-                        response = null_resp();
-                    }
-                };
-            }
-            Command::Info => {
-                match command_items.get(1) {
-                    Some((_pre, info_type)) => {
-                        let info_type = *info_type;
-                        if info_type.eq("replication") {
-                            let repl_config = server_repl_config.lock().unwrap();
-                            response = bulk_string_resp(
-                                format!(
-                                    "role:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}",
-                                    repl_config.role,
-                                    repl_config.master_replid,
-                                    repl_config.master_repl_offset
-                                )
-                                .as_str(),
-                            );
-                        } else {
-                            response = null_resp();
-                        }
-                    }
-                    None => {
-                        println!("no message");
-                    }
-                };
-            }
-            Command::Replconf => {
-                let conf_key = match command_items.get(1) {
-                    Some((_pre, conf_key)) => {
-                        let conf_key = *conf_key;
-                        match conf_key.to_ascii_lowercase().as_str() {
-                            "listening-port" => {
-                                response = simple_resp("OK");
-                            },
-                            "capa" => {
-                                response = simple_resp("OK");
-                            },
-                            _ => {
-                                response = null_resp();
-                            }
-                        }
-                        conf_key
-                    }
-                    None => {
-                        ""
-                    }
-                };
-                let conf_value = match command_items.get(2) {
-                    Some((_pre, replconf_type)) => {
-                        let replconf_type = *replconf_type;
-                        replconf_type
-                    }
-                    None => {
-                        ""
-                    }
-                };
-                println!("REPLCONF {} {}", conf_key, conf_value);
-            },
-            Command::Psync => {
-                let repl_config = server_repl_config.lock().unwrap();
-                let repl_id = if let Some(repl_id) = command_items.get(1) {
-                    if repl_id.1.to_ascii_lowercase().as_str() == "?" {
-                        should_send_repl_init = true;
-                        Some(repl_config.master_replid.clone())
                     } else {
-                        Some(repl_id.1.to_string())
+                        null_resp()
                     }
-                } else {
-                    None
-                };
-
-                let repl_offset = if let Some(repl_offset) = command_items.get(2) {
-                    if repl_offset.1.to_ascii_lowercase().as_str() == "-1" {
-                        should_send_repl_init = should_send_repl_init && true;
-                        Some(format!("{}", repl_config.master_repl_offset))
-                    } else {
-                        Some(repl_offset.1.clone())
-                    }
-                } else {
-                    None
-                };
-
-                if let (Some(repl_id), Some(repl_offset)) = (repl_id, repl_offset) {
-                    response = simple_resp(format!("FULLRESYNC {} {}", repl_id, repl_offset).as_str());
                 }
-            },
+                None => {
+                    arg_error_resp("get")
+                }
+            }
         }
-    }
+        Command::Info(com_args) => {
+            match com_args.get(0) {
+                Some((_pre, info_type)) => {
+                    if info_type.eq("replication") {
+                        let repl_config = server_repl_config.lock().unwrap();
+                        bulk_string_resp(
+                            format!(
+                                "role:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}",
+                                repl_config.role,
+                                repl_config.master_replid,
+                                repl_config.master_repl_offset
+                            )
+                            .as_str(),
+                        )
+                    } else {
+                        null_resp()
+                    }
+                }
+                None => {
+                    arg_error_resp("info") // TODO: not supported yet
+                }
+            }
+        }
+        Command::Replconf(com_args) => {
+            match (com_args.get(0), com_args.get(1)) {
+                (Some(conf_key), Some(conf_val)) => {
+                    println!("REPLCONF {} {}", conf_key.1, conf_val.1);
+                }
+                _ => (),
+            };
+            simple_resp("OK")
+        }
+        Command::Psync(com_args) => {
+            let repl_config = server_repl_config.lock().unwrap();
+            match (com_args.get(0), com_args.get(1)) {
+                (Some(conf_key), Some(conf_val)) => {
+                    should_send_repl_init = true;
+                    add_repl_client = true;
+                    if conf_key.1.to_ascii_lowercase().as_str() == "?"
+                        && conf_val.1.to_ascii_lowercase().as_str() == "-1"
+                    {
+                        simple_resp(
+                            format!(
+                                "FULLRESYNC {} {}",
+                                repl_config.master_replid, repl_config.master_repl_offset
+                            )
+                            .as_str(),
+                        )
+                    } else {
+                        simple_resp(format!("FULLRESYNC {} {}", conf_key.1, 0).as_str())
+                    }
+                }
+                _ => {
+                    arg_error_resp("psync")
+                }
+            }
+        }
+    };
 
     let mut responses = Vec::with_capacity(2);
     responses.push(response.as_bytes().to_vec());
     if should_send_repl_init {
         responses.push(empty_rdb_resp());
     }
-    responses
+    ResponseContext {
+        responses,
+        add_repl_client,
+    }
 }
