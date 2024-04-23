@@ -369,6 +369,8 @@ async fn process_repl_connection(client_buffer: &[u8; BUFFER_SIZE], data_store: 
         .into_iter()
         .map(|r| r as char)
         .collect::<String>();
+
+    println!("REPL: received {:?}", command);
     if command.starts_with("+FULLRESYNC") {
         let lines: Vec<_> = command.match_indices("\r\n").collect();
         if lines.len() > 1 {
