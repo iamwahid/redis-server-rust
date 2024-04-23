@@ -166,10 +166,11 @@ struct DataStoreValue {
 struct ServerReplicationConfig {
     role: String,
     master_replid: String,
-    master_repl_offset: u8,
+    master_repl_offset: usize,
     master_host: Option<String>,
     master_port: Option<u16>,
     repl_clients: HashMap<SocketAddr, Arc<Mutex<TcpStream>>>,
+    repl_init_done: bool,
 }
 
 impl ServerReplicationConfig {
@@ -374,8 +375,8 @@ async fn replica_listener_loop(listener: TcpListener, replication_stream: Arc<Mu
                     Ok(n) => {
                         if n != 0 {
                             let data_store = data_store.clone();
-                            let server_repl_config = server_repl_config.clone();
-                            process_repl_connection(&mut replication_stream, &client_buffer, data_store, server_repl_config).await
+                            let mut server_repl_config = server_repl_config.lock().await;
+                            process_repl_connection(&mut replication_stream, &client_buffer, data_store, &mut server_repl_config).await
                         }
                     },
                     Err(_error) => println!("Can't read response")
@@ -386,11 +387,13 @@ async fn replica_listener_loop(listener: TcpListener, replication_stream: Arc<Mu
     }
 }
 
-async fn process_repl_connection(replication_stream: &mut TcpStream, client_buffer: &[u8; BUFFER_SIZE], data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>,) {
+async fn process_repl_connection(replication_stream: &mut TcpStream, client_buffer: &[u8; BUFFER_SIZE], data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: &mut ServerReplicationConfig) {
     let mut buffer_iter = client_buffer.into_iter();
     let mut parsed_buffer: Vec<Vec<u8>> = Vec::new();
     let mut remaining_buffer: Vec<Vec<String>> = Vec::new();
     let mut rdb_data: Vec<u8> = Vec::new();
+    let mut bytes_processed = server_repl_config.master_repl_offset;
+    let mut repl_init_done = server_repl_config.repl_init_done;
 
     while let Some(buf) = buffer_iter.next() {
         if *buf == '$' as u8 && rdb_data.len() == 0 {
@@ -416,29 +419,41 @@ async fn process_repl_connection(replication_stream: &mut TcpStream, client_buff
             }
             parsed_buffer.push(rdb_data.clone());
         } else if *buf == '+' as u8 {
+            // count bytes here
+            // bytes_processed = bytes_processed + 1;
             let mut simple_str: Vec<u8> = Vec::new();
             simple_str.push(*buf);
             'simplestr: while let Some(ss) = buffer_iter.next() {
-                let next = buffer_iter.next().unwrap();
+                // bytes_processed = bytes_processed + 1;
                 simple_str.push(*ss);
+                let next = buffer_iter.next().unwrap();
+                // bytes_processed = bytes_processed + 1;
+                simple_str.push(*next);
                 if *next == '\r' as u8 {
                     let next_next = buffer_iter.next().unwrap();
+                    // bytes_processed = bytes_processed + 1;
+                    simple_str.push(*next_next);
                     if *next_next == '\n' as u8 {
                         break 'simplestr;
                     } else {
-                        simple_str.push(*next);
-                        simple_str.push(*next_next);
+                        break 'simplestr;
                     }
-                } else {
-                    simple_str.push(*next);
                 }
             }
             parsed_buffer.push(simple_str);
         } else if *buf == '*' as u8 {
+            // count bytes here
+            // bytes_processed = bytes_processed + 1;
+            let mut command_buffer: Vec<u8> = Vec::new();
             let mut raw_len = String::new();
+            command_buffer.push(*buf);
             'commandlen: while let Some(len_) = buffer_iter.next() {
+                // bytes_processed = bytes_processed + 1;
+                command_buffer.push(*len_);
                 if *len_ == '\r' as u8 {
                     let next_next = buffer_iter.next().unwrap();
+                    // bytes_processed = bytes_processed + 1;
+                    command_buffer.push(*next_next);
                     if *next_next == '\n' as u8 {
                         break 'commandlen;
                     } else {
@@ -453,8 +468,12 @@ async fn process_repl_connection(replication_stream: &mut TcpStream, client_buff
             let mut offset = 0;
             'comlen: while offset < com_len {
                 if let Some(c) = buffer_iter.next() {
+                    // bytes_processed = bytes_processed + 1;
+                    command_buffer.push(*c);
                     if *c == '\r' as u8 {
                         let c_next = buffer_iter.next().unwrap();
+                        command_buffer.push(*c_next);
+                        // bytes_processed = bytes_processed + 1;
                         if *c_next == '\n' as u8 {
                             continue 'comlen;
                         } else {
@@ -464,8 +483,12 @@ async fn process_repl_connection(replication_stream: &mut TcpStream, client_buff
                     if *c == '$' as u8 {
                         let mut raw_txtlen = String::new();
                         'txtlen: while let Some(len_) = buffer_iter.next() {
+                            // bytes_processed = bytes_processed + 1;
+                            command_buffer.push(*len_);
                             if *len_ == '\r' as u8 {
                                 let next_next = buffer_iter.next().unwrap();
+                                // bytes_processed = bytes_processed + 1;
+                                command_buffer.push(*next_next);
                                 if *next_next == '\n' as u8 {
                                     break 'txtlen;
                                 } else {
@@ -477,8 +500,12 @@ async fn process_repl_connection(replication_stream: &mut TcpStream, client_buff
                         let txtlen = raw_txtlen.parse::<usize>().unwrap_or(0);
                         let mut parsed_txt = String::new();
                         'txt: while let Some(t) = buffer_iter.next() {
+                            // bytes_processed = bytes_processed + 1;
+                            command_buffer.push(*t);
                             if *t == '\r' as u8 {
-                                buffer_iter.next();
+                                let t_next = buffer_iter.next().unwrap();
+                                // bytes_processed = bytes_processed + 1;
+                                command_buffer.push(*t_next);
                                 break 'txt;
                             }
                             if parsed_txt.len() < txtlen {
@@ -490,31 +517,38 @@ async fn process_repl_connection(replication_stream: &mut TcpStream, client_buff
                     }
                 }
             }
-
+            parsed_buffer.push(command_buffer);
             remaining_buffer.push(commands);
         }
     }
 
     let parsed_debug = parsed_buffer.iter().map(|a| {a.iter().map(|f| *f as char).collect::<String>()}).collect::<Vec<String>>();
 
-    for debg in parsed_debug {
+    println!("parsed_debug {:?}", parsed_debug);
+
+    for (i, debg) in parsed_debug.into_iter().enumerate() {
         if debg.starts_with("+FULLRESYNC") {
             println!("PSYNC replied {}", debg);
-        } else {
+        } else if !repl_init_done {
+            repl_init_done = true;
             println!(
                 "Full resync with master, discarding {} bytes of bulk transfer...",
                 rdb_data.len()
             );
             println!("Full resync done. Logging commands from master.");
+        } else {
+            bytes_processed = bytes_processed + parsed_buffer.get(i).unwrap().len();
         }
     }
+    server_repl_config.repl_init_done = repl_init_done;
+    server_repl_config.master_repl_offset = bytes_processed;
+    println!("bytes_processed {}", bytes_processed);
 
     for cmd in remaining_buffer {
         let command = parse_command(cmd);
         if let Some(command) = command {
             let mut data_store = data_store.lock().await;
-            let mut server_repl_config = server_repl_config.lock().await;
-            let context = process_command(command, &mut data_store, &mut server_repl_config).await;
+            let context = process_command(command, &mut data_store, server_repl_config).await;
             if context.should_send_repl_reply {
                 println!("should_send_repl_reply");
                 write_response(replication_stream, context.responses).await.unwrap();
@@ -772,7 +806,7 @@ async fn process_command(
                 },
                 ["getack", _ack] => {
                     should_send_repl_reply = true;
-                    resp = array_resp(vec!["REPLCONF", "ACK", "0"]);
+                    resp = array_resp(vec!["REPLCONF", "ACK", format!("{}", server_repl_config.master_repl_offset).as_str()]);
                 },
                 _ => (),
             };
