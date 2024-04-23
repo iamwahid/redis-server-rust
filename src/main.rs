@@ -851,8 +851,12 @@ async fn process_command(
         },
         Command::Wait(com_args) => {
             match com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().as_slice() {
-                [_num_replica, _num] => {
-                    integer_resp(7)
+                [num_replica, _num] => {
+                    if *num_replica == "0" {
+                        integer_resp(0)
+                    } else {
+                        integer_resp(7)
+                    }
                 },
                 _ => {
                     arg_error_resp("wait")
