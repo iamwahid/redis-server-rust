@@ -112,6 +112,13 @@ fn empty_rdb_resp() -> Vec<u8> {
     [len.as_bytes(), &empty_rdb].concat()
 }
 
+#[allow(dead_code)]
+fn empty_rdb_and_propagate() -> Vec<u8> {
+    let empty = empty_rdb_resp();
+    let propagate = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\n123\r\n*3\r\n$3\r\nSET\r\n$3\r\nbar\r\n$3\r\n456\r\n*3\r\n$3\r\nSET\r\n$3\r\nbaz\r\n$3\r\n789\r\n".as_bytes().to_vec();
+    [empty, propagate].concat()
+}
+
 #[derive(Hash, Eq, PartialEq, Debug)]
 enum ServerArg {
     Port(u16),
@@ -364,37 +371,130 @@ async fn listener_loop(listener: TcpListener, mut replication_stream: Option<Tcp
 }
 
 async fn process_repl_connection(client_buffer: &[u8; BUFFER_SIZE], data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>,) {
-    let mut command = client_buffer
-        .to_vec()
-        .into_iter()
-        .map(|r| r as char)
-        .collect::<String>();
+    let mut buffer_iter = client_buffer.into_iter();
+    let mut parsed_buffer: Vec<Vec<u8>> = Vec::new();
+    let mut remaining_buffer: Vec<Vec<String>> = Vec::new();
+    let mut rdb_data: Vec<u8> = Vec::new();
 
-    println!("REPL: received {:?}", command);
-    if command.starts_with("+FULLRESYNC") {
-        let lines: Vec<_> = command.match_indices("\r\n").collect();
-        if lines.len() > 1 {
-            let first_line = lines.first().unwrap().0;
-            let drained: String = command.drain(0..first_line+2).collect();
-            print!("PSYNC replied {}", drained.as_str());
-            let len: Vec<_> = command.split("\r\n").into_iter().collect();
+    while let Some(buf) = buffer_iter.next() {
+        if *buf == '$' as u8 && rdb_data.len() == 0 {
+            let mut raw_len = String::new();
+            'rdb: while let Some(len_) = buffer_iter.next() {
+                if *len_ == '\r' as u8 {
+                    let next_next = buffer_iter.next().unwrap();
+                    if *next_next == '\n' as u8 {
+                        break 'rdb;
+                    } else {
+                        break 'rdb;
+                    }
+                }
+                raw_len = format!("{}{}", raw_len, *len_ as char);
+            }
+            let len = raw_len.parse::<usize>().unwrap();
+            let mut offset: usize = 0;
+            while offset < len {
+                if let Some(rdb) = buffer_iter.next() {
+                    rdb_data.push(*rdb);
+                }
+                offset = offset + 1;
+            }
+            parsed_buffer.push(rdb_data.clone());
+        } else if *buf == '+' as u8 {
+            let mut simple_str: Vec<u8> = Vec::new();
+            simple_str.push(*buf);
+            'simplestr: while let Some(ss) = buffer_iter.next() {
+                let next = buffer_iter.next().unwrap();
+                simple_str.push(*ss);
+                if *next == '\r' as u8 {
+                    let next_next = buffer_iter.next().unwrap();
+                    if *next_next == '\n' as u8 {
+                        break 'simplestr;
+                    } else {
+                        simple_str.push(*next);
+                        simple_str.push(*next_next);
+                    }
+                } else {
+                    simple_str.push(*next);
+                }
+            }
+            parsed_buffer.push(simple_str);
+        } else if *buf == '*' as u8 {
+            let mut raw_len = String::new();
+            'commandlen: while let Some(len_) = buffer_iter.next() {
+                if *len_ == '\r' as u8 {
+                    let next_next = buffer_iter.next().unwrap();
+                    if *next_next == '\n' as u8 {
+                        break 'commandlen;
+                    } else {
+                        break 'commandlen;
+                    }
+                }
+                raw_len = format!("{}{}", raw_len, *len_ as char);
+            }
+
+            let mut commands: Vec<String> = Vec::new();
+            let com_len = raw_len.parse::<usize>().unwrap_or(0);
+            let mut offset = 0;
+            'comlen: while offset < com_len {
+                if let Some(c) = buffer_iter.next() {
+                    if *c == '\r' as u8 {
+                        let c_next = buffer_iter.next().unwrap();
+                        if *c_next == '\n' as u8 {
+                            continue 'comlen;
+                        } else {
+                            continue 'comlen;
+                        }
+                    }
+                    if *c == '$' as u8 {
+                        let mut raw_txtlen = String::new();
+                        'txtlen: while let Some(len_) = buffer_iter.next() {
+                            if *len_ == '\r' as u8 {
+                                let next_next = buffer_iter.next().unwrap();
+                                if *next_next == '\n' as u8 {
+                                    break 'txtlen;
+                                } else {
+                                    break 'txtlen;
+                                }
+                            }
+                            raw_txtlen = format!("{}{}", raw_txtlen, *len_ as char);
+                        }
+                        let txtlen = raw_txtlen.parse::<usize>().unwrap_or(0);
+                        let mut parsed_txt = String::new();
+                        'txt: while let Some(t) = buffer_iter.next() {
+                            if *t == '\r' as u8 {
+                                buffer_iter.next();
+                                break 'txt;
+                            }
+                            if parsed_txt.len() < txtlen {
+                                parsed_txt = format!("{}{}", parsed_txt, *t as char);
+                            }
+                        }
+                        commands.push(parsed_txt.clone());
+                        offset = offset + 1;
+                    }
+                }
+            }
+
+            remaining_buffer.push(commands);
+        }
+    }
+
+    let parsed_debug = parsed_buffer.iter().map(|a| {a.iter().map(|f| *f as char).collect::<String>()}).collect::<Vec<String>>();
+
+    for debg in parsed_debug {
+        if debg.starts_with("+FULLRESYNC") {
+            println!("PSYNC replied {}", debg);
+        } else {
             println!(
                 "Full resync with master, discarding {} bytes of bulk transfer...",
-                len.first().unwrap().replace("$", "")
+                rdb_data.len()
             );
             println!("Full resync done. Logging commands from master.");
-        } else {
-            print!("PSYNC replied {}", command);
         }
-    } else if command.starts_with("$") && !command.ends_with("\r\n") {
-        let len: Vec<_> = command.split("\r\n").into_iter().collect();
-        println!(
-            "Full resync with master, discarding {} bytes of bulk transfer...",
-            len.first().unwrap().replace("$", "")
-        );
-        println!("Full resync done. Logging commands from master.");
-    } else {
-        let command = parse_req(client_buffer);
+    }
+
+    for cmd in remaining_buffer {
+        let command = parse_command(cmd);
         if let Some(command) = command {
             let mut data_store = data_store.lock().await;
             let mut server_repl_config = server_repl_config.lock().await;
@@ -435,6 +535,29 @@ fn parse_args(args: Args) -> HashSet<ServerArg> {
         }
     }
     parsed_args
+}
+
+
+fn parse_command(mut command_items: Vec<String>) -> Option<Command> {
+    if let Some(first) = command_items.first_mut() {
+        *first = first.to_ascii_lowercase();
+    }
+    let comm_parse: Vec<&str> = command_items.iter().map(|s| s.as_str()).collect();
+    let str_to_string = |strs: Vec<&str>| {
+        strs.into_iter().map(|s| s.to_string()).collect::<Vec<String>>()
+    };
+    // parse command
+    let command: Option<Command> = match comm_parse.as_slice() {
+        ["ping"] => Some(Command::Ping),
+        ["echo", args @ ..] => Some(Command::Echo(str_to_string(args.to_vec()))),
+        ["set", args @ ..] => Some(Command::Set(str_to_string(args.to_vec()))),
+        ["get", args @ ..] => Some(Command::Get(str_to_string(args.to_vec()))),
+        ["info", args @ ..] => Some(Command::Info(str_to_string(args.to_vec()))),
+        ["replconf", args @ ..] => Some(Command::Replconf(str_to_string(args.to_vec()))),
+        ["psync", args @ ..] => Some(Command::Psync(str_to_string(args.to_vec()))),
+        _ => None,
+    };
+    command
 }
 
 // parse buffer as vector
@@ -478,23 +601,7 @@ fn parse_req(&buffer: &[u8; BUFFER_SIZE]) -> Option<Command> {
         offset = offset + 2;
     }
 
-    let comm_parse: Vec<&str> = command_items.iter().map(|s| s.as_str()).collect();
-    let str_to_string = |strs: Vec<&str>| {
-        strs.into_iter().map(|s| s.to_string()).collect::<Vec<String>>()
-    };
-    // parse command
-    let command: Option<Command> = match comm_parse.as_slice() {
-        ["ping"] => Some(Command::Ping),
-        ["echo", args @ ..] => Some(Command::Echo(str_to_string(args.to_vec()))),
-        ["set", args @ ..] => Some(Command::Set(str_to_string(args.to_vec()))),
-        ["get", args @ ..] => Some(Command::Get(str_to_string(args.to_vec()))),
-        ["info", args @ ..] => Some(Command::Info(str_to_string(args.to_vec()))),
-        ["replconf", args @ ..] => Some(Command::Replconf(str_to_string(args.to_vec()))),
-        ["psync", args @ ..] => Some(Command::Psync(str_to_string(args.to_vec()))),
-        _ => None,
-    };
-
-    command
+    parse_command(command_items)
 }
 
 // should be save only
