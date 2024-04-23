@@ -54,7 +54,7 @@ async fn main() {
                 .expect("Failed to connect Master");
             // handle handshake
             handle_repl_handshake(&mut client, bind_address.1).await.unwrap();
-            Some(client)
+            Some(Arc::new(Mutex::new(client)))
         } else {
             None
         }
@@ -67,7 +67,11 @@ async fn main() {
     let server_repl_config: Arc<Mutex<ServerReplicationConfig>> =
         Arc::new(Mutex::new(server_repl_config)); 
 
-    listener_loop(listener, replication_stream, data_store, server_repl_config).await
+    if let Some(replica_stream) = replication_stream {
+        replica_listener_loop(listener, replica_stream, data_store, server_repl_config).await;
+    } else {
+        master_listener_loop(listener, data_store, server_repl_config).await
+    }
 }
 
 fn simple_resp(message: &str) -> String {
@@ -117,6 +121,13 @@ fn empty_rdb_and_propagate() -> Vec<u8> {
     let empty = empty_rdb_resp();
     let propagate = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\n123\r\n*3\r\n$3\r\nSET\r\n$3\r\nbar\r\n$3\r\n456\r\n*3\r\n$3\r\nSET\r\n$3\r\nbaz\r\n$3\r\n789\r\n".as_bytes().to_vec();
     [empty, propagate].concat()
+}
+
+#[allow(dead_code)]
+fn empty_rdb_and_getack() -> Vec<u8> {
+    let empty = empty_rdb_resp();
+    let getack = "*3\r\n$8\r\nreplconf\r\n$6\r\ngetack\r\n$1\r\n*\r\n".as_bytes().to_vec();
+    [empty, getack].concat()
 }
 
 #[derive(Hash, Eq, PartialEq, Debug)]
@@ -194,6 +205,7 @@ impl ServerReplicationConfig {
 struct RequestContext {
     responses: Vec<Vec<u8>>,
     add_repl_client: bool,
+    should_send_repl_reply: bool,
 }
 
 struct ConnectionManager {
@@ -322,55 +334,59 @@ async fn handle_repl_handshake(client: &mut TcpStream, bind_port: u16) -> Result
     Ok(())
 }
 
-async fn listener_loop(listener: TcpListener, mut replication_stream: Option<TcpStream>, data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>) {
+async fn master_listener_loop(listener: TcpListener, data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>) {
     loop {
-        // Replication
-        if let Some(ref mut replication_stream) = replication_stream {
-            let mut client_buffer = [0u8; BUFFER_SIZE];
-            tokio::select! {
-                stream = listener.accept() => {
-                    let (stream, client) = stream.unwrap();
-                    let stream = Arc::new(Mutex::new(stream));
-                    let data_store = data_store.clone();
-                    let server_repl_config = server_repl_config.clone();
-
-                    // determine if it replication connection
-                    let stream = stream.clone();
-                    tokio::spawn(async move {
-                        ConnectionManager::new(stream, client).handle(data_store, server_repl_config).await
-                    });
-                    
-                },
-                repl_buffer = replication_stream.read(&mut client_buffer) => {
-                    // receive replication
-                    match repl_buffer {
-                        Ok(n) => {
-                            if n != 0 {
-                                let data_store = data_store.clone();
-                                let server_repl_config = server_repl_config.clone();
-                                process_repl_connection(&client_buffer, data_store, server_repl_config).await
-                            }
-                        },
-                        Err(_error) => println!("Can't read response")
-                    }
-                }
-            }
-        } else {
-            let (stream, client) = listener.accept().await.unwrap();
-            println!("from client {:?}", client);
-            let stream = Arc::new(Mutex::new(stream));
-            let data_store = data_store.clone();
-            let server_repl_config = server_repl_config.clone();
-
-            let stream = stream.clone();
-            tokio::spawn(async move {
-                ConnectionManager::new(stream, client).handle(data_store, server_repl_config).await
-            });
-        }
+        let (stream, client) = listener.accept().await.unwrap();
+        println!("from client {:?}", client);
+        let stream = Arc::new(Mutex::new(stream));
+        let data_store = data_store.clone();
+        let server_repl_config = server_repl_config.clone();
+    
+        let stream = stream.clone();
+        tokio::spawn(async move {
+            ConnectionManager::new(stream, client).handle(data_store, server_repl_config).await
+        });
     }
 }
 
-async fn process_repl_connection(client_buffer: &[u8; BUFFER_SIZE], data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>,) {
+async fn replica_listener_loop(listener: TcpListener, replication_stream: Arc<Mutex<TcpStream>>, data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>) {
+    loop {
+        // Replication
+        let mut client_buffer = [0u8; BUFFER_SIZE];
+        let mut replication_stream = replication_stream.lock().await;
+        tokio::select! {
+            stream = listener.accept() => {
+                let (stream, client) = stream.unwrap();
+                let stream = Arc::new(Mutex::new(stream));
+                let data_store = data_store.clone();
+                let server_repl_config = server_repl_config.clone();
+
+                // determine if it replication connection
+                let stream = stream.clone();
+                tokio::spawn(async move {
+                    ConnectionManager::new(stream, client).handle(data_store, server_repl_config).await
+                });
+                
+            },
+            repl_buffer = replication_stream.read(&mut client_buffer) => {
+                // receive replication
+                match repl_buffer {
+                    Ok(n) => {
+                        if n != 0 {
+                            let data_store = data_store.clone();
+                            let server_repl_config = server_repl_config.clone();
+                            process_repl_connection(&mut replication_stream, &client_buffer, data_store, server_repl_config).await
+                        }
+                    },
+                    Err(_error) => println!("Can't read response")
+                }
+            }
+        }
+        // if let Some(ref mut replication_stream) = replication_stream 
+    }
+}
+
+async fn process_repl_connection(replication_stream: &mut TcpStream, client_buffer: &[u8; BUFFER_SIZE], data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>,) {
     let mut buffer_iter = client_buffer.into_iter();
     let mut parsed_buffer: Vec<Vec<u8>> = Vec::new();
     let mut remaining_buffer: Vec<Vec<String>> = Vec::new();
@@ -498,7 +514,11 @@ async fn process_repl_connection(client_buffer: &[u8; BUFFER_SIZE], data_store: 
         if let Some(command) = command {
             let mut data_store = data_store.lock().await;
             let mut server_repl_config = server_repl_config.lock().await;
-            process_command(command, &mut data_store, &mut server_repl_config).await;
+            let context = process_command(command, &mut data_store, &mut server_repl_config).await;
+            if context.should_send_repl_reply {
+                println!("should_send_repl_reply");
+                write_response(replication_stream, context.responses).await.unwrap();
+            }
         }
     }
 }
@@ -606,11 +626,12 @@ fn parse_req(&buffer: &[u8; BUFFER_SIZE]) -> Option<Command> {
 
 // should be save only
 async fn process_command(
-    ref command: Command,
+    ref mut command: Command,
     data_store: &mut HashMap<String, DataStoreValue>,
     server_repl_config: &mut ServerReplicationConfig,
 ) -> RequestContext {
     let mut should_send_repl_init = false;
+    let mut should_send_repl_reply = false;
     let mut add_repl_client = false;
     let response = match command {
         Command::Ping => {
@@ -737,17 +758,25 @@ async fn process_command(
                 }
             }
         }
-        Command::Replconf(com_args) => {
+        Command::Replconf(ref mut com_args) => {
+            if let Some(first) = com_args.first_mut() {
+                *first = first.to_ascii_lowercase();
+            }
+            let mut resp = simple_resp("OK");
             match com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().as_slice() {
                 ["listening-port", port] => {
                     println!("REPLCONF {} {}", "listening-port", port);
                 }
                 ["capa", capa] => {
                     println!("REPLCONF {} {}", "capa", capa);
-                }
+                },
+                ["getack", _ack] => {
+                    should_send_repl_reply = true;
+                    resp = array_resp(vec!["REPLCONF", "ACK", "0"]);
+                },
                 _ => (),
             };
-            simple_resp("OK")
+            resp
         }
         Command::Psync(com_args) => {
             let repl_config = server_repl_config;
@@ -776,10 +805,11 @@ async fn process_command(
     let mut responses = Vec::with_capacity(2);
     responses.push(response.as_bytes().to_vec());
     if should_send_repl_init {
-        responses.push(empty_rdb_resp());
+        responses.push(empty_rdb_and_getack());
     }
     RequestContext {
         responses,
         add_repl_client,
+        should_send_repl_reply,
     }
 }
