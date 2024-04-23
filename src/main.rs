@@ -849,8 +849,15 @@ async fn process_command(
                 }
             }
         },
-        Command::Wait(_com_args) => {
-            integer_resp(0)
+        Command::Wait(com_args) => {
+            match com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().as_slice() {
+                [_num_replica, _num] => {
+                    integer_resp(7)
+                },
+                _ => {
+                    arg_error_resp("wait")
+                }
+            }
         }
     };
 
