@@ -851,12 +851,9 @@ async fn process_command(
         },
         Command::Wait(com_args) => {
             match com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().as_slice() {
-                [num_replica, _num] => {
-                    if *num_replica == "0" {
-                        integer_resp(0)
-                    } else {
-                        integer_resp(7)
-                    }
+                [_num_replica, _num] => {
+                    let count = server_repl_config.repl_clients.len();
+                    integer_resp(count as i32)
                 },
                 _ => {
                     arg_error_resp("wait")
