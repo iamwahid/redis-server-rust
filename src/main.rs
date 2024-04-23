@@ -540,8 +540,6 @@ async fn process_repl_connection(replication_stream: &mut TcpStream, client_buff
             bytes_processed = bytes_processed + parsed_buffer.get(i).unwrap().len();
         }
     }
-    server_repl_config.repl_init_done = repl_init_done;
-    server_repl_config.master_repl_offset = bytes_processed;
     println!("bytes_processed {}", bytes_processed);
 
     for cmd in remaining_buffer {
@@ -555,6 +553,8 @@ async fn process_repl_connection(replication_stream: &mut TcpStream, client_buff
             }
         }
     }
+    server_repl_config.repl_init_done = repl_init_done;
+    server_repl_config.master_repl_offset = bytes_processed;
 }
 
 fn parse_args(args: Args) -> HashSet<ServerArg> {
