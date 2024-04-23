@@ -805,7 +805,7 @@ async fn process_command(
     let mut responses = Vec::with_capacity(2);
     responses.push(response.as_bytes().to_vec());
     if should_send_repl_init {
-        responses.push(empty_rdb_and_getack());
+        responses.push(empty_rdb_resp());
     }
     RequestContext {
         responses,
