@@ -103,6 +103,10 @@ fn array_resp(messages: Vec<&str>) -> String {
     resp
 }
 
+fn integer_resp(num: i32) -> String {
+    format!(":{}\r\n", num)
+}
+
 fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
     (0..s.len())
         .step_by(2)
@@ -146,6 +150,7 @@ enum Command {
     Info(Vec<String>),
     Replconf(Vec<String>),
     Psync(Vec<String>),
+    Wait(Vec<String>),
 }
 
 // impl Clone for Command { fn clone(&self) -> Self { *self } }
@@ -618,6 +623,7 @@ fn parse_command(mut command_items: Vec<String>) -> Option<Command> {
         ["info", args @ ..] => Some(Command::Info(str_to_string(args.to_vec()))),
         ["replconf", args @ ..] => Some(Command::Replconf(str_to_string(args.to_vec()))),
         ["psync", args @ ..] => Some(Command::Psync(str_to_string(args.to_vec()))),
+        ["wait", args @ ..] => Some(Command::Wait(str_to_string(args.to_vec()))),
         _ => None,
     };
     command
@@ -842,6 +848,9 @@ async fn process_command(
                     arg_error_resp("psync")
                 }
             }
+        },
+        Command::Wait(_com_args) => {
+            integer_resp(0)
         }
     };
 
