@@ -525,6 +525,7 @@ async fn process_repl_connection(replication_stream: &mut TcpStream, client_buff
     let parsed_debug = parsed_buffer.iter().map(|a| {a.iter().map(|f| *f as char).collect::<String>()}).collect::<Vec<String>>();
 
     println!("parsed_debug {:?}", parsed_debug);
+    let mut savelater = false;
 
     for (i, debg) in parsed_debug.into_iter().enumerate() {
         if debg.starts_with("+FULLRESYNC") {
@@ -538,6 +539,12 @@ async fn process_repl_connection(replication_stream: &mut TcpStream, client_buff
             println!("Full resync done. Logging commands from master.");
         } else {
             bytes_processed = bytes_processed + parsed_buffer.get(i).unwrap().len();
+            if debg.to_lowercase().contains("replconf") && debg.to_ascii_lowercase().contains("getack") {
+                savelater = true;
+            } else {
+                server_repl_config.repl_init_done = repl_init_done;
+                server_repl_config.master_repl_offset = bytes_processed;
+            }
         }
     }
     println!("bytes_processed {}", bytes_processed);
@@ -553,8 +560,10 @@ async fn process_repl_connection(replication_stream: &mut TcpStream, client_buff
             }
         }
     }
-    server_repl_config.repl_init_done = repl_init_done;
-    server_repl_config.master_repl_offset = bytes_processed;
+    if savelater {
+        server_repl_config.repl_init_done = repl_init_done;
+        server_repl_config.master_repl_offset = bytes_processed;
+    }
 }
 
 fn parse_args(args: Args) -> HashSet<ServerArg> {
