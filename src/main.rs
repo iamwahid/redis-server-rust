@@ -367,6 +367,7 @@ impl ConnectionManager {
                     }
 
                     let mut repl_config = server_repl_config.lock().await;
+                    println!("repl_config.master_repl_offset {}", repl_config.master_repl_offset);
                     match command {
                         Command::Wait(_) => {
                             if repl_config.master_repl_offset == 0 || context.wait_reached > repl_config.repl_clients.len() {
