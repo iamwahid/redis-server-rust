@@ -358,7 +358,6 @@ impl ConnectionManager {
                             // stop waiting when timeout reached
                             // stop waiting when replica replied count reached current connected replicas
                             let elapsed = timenow.duration_since(wait_from);
-                            println!("Elapsed2: {:?}", elapsed);
                             let mut repl_config = server_repl_config.lock().await;
                             if elapsed >= context.wait_for || repl_config.replied_replica >= context.wait_reached {
                                 println!("Reached {:?} {}",  elapsed, repl_config.replied_replica);
