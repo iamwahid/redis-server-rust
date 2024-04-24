@@ -296,7 +296,7 @@ impl ReplicaConnection {
                                         let acked_number = number.parse::<usize>().unwrap_or(0);
                                         self.offset = acked_number;
                                         let mut repl_config = server_repl_config.lock().await;
-                                        if self.offset <= repl_config.master_repl_offset {
+                                        if self.offset == repl_config.master_repl_offset {
                                             repl_config.replied_replica = repl_config.replied_replica + 1;
                                         }
                                     },
@@ -372,16 +372,16 @@ impl ConnectionManager {
                     println!("repl_config.master_repl_offset {}", repl_config.master_repl_offset);
                      match command {
                         Command::Wait(_) => {
-                            let waited_before = if let Some(last_commmand) = repl_config.last_command.clone() {
+                            let send_repl_len = if let Some(last_commmand) = repl_config.last_command.clone() {
                                 if let Command::Wait(_) = last_commmand {
                                     true
                                 } else {
                                     false
                                 }
                             } else {
-                                false
+                                true
                             };
-                            if repl_config.master_repl_offset == 0 || context.wait_reached > repl_config.repl_clients.len() || waited_before {
+                            if context.wait_reached > repl_config.repl_clients.len() || send_repl_len {
                                 let mod_response = vec![integer_resp(repl_config.repl_clients.len() as i32).as_bytes().to_vec()];
                                 context.responses = mod_response;
                             }
