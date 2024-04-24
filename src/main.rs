@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::num::ParseIntError;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::{env, env::Args};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, Mutex};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, Instant};
@@ -20,8 +20,6 @@ async fn main() {
     let parsed = parse_args(env::args());
 
     let (broadcaster, _) = broadcast::channel::<ReplMessage>(20);
-    let (sender, receiver) = mpsc::channel::<usize>(1);
-    let receiver = Arc::new(Mutex::new(receiver));
 
     // config values
     let mut server_repl_config = ServerReplicationConfig::new(
@@ -33,7 +31,6 @@ async fn main() {
         HashMap::new(),
         false,
         broadcaster,
-        sender,
     );
 
     let mut bind_address = ("127.0.0.1", DEFAULT_PORT);
@@ -77,9 +74,9 @@ async fn main() {
         Arc::new(Mutex::new(server_repl_config));
 
     if let Some(replica_stream) = replication_stream {
-        slave_listener_loop(listener, replica_stream, data_store, server_repl_config, receiver).await;
+        slave_listener_loop(listener, replica_stream, data_store, server_repl_config).await;
     } else {
-        master_listener_loop(listener, data_store, server_repl_config, receiver).await
+        master_listener_loop(listener, data_store, server_repl_config).await
     }
 }
 
@@ -189,7 +186,7 @@ struct ServerReplicationConfig {
     repl_clients: HashMap<SocketAddr, Arc<Mutex<TcpStream>>>,
     repl_init_done: bool,
     broadcaster: broadcast::Sender<ReplMessage>,
-    sender: mpsc::Sender<usize>,
+    replied_replica: usize,
 }
 
 impl ServerReplicationConfig {
@@ -202,7 +199,6 @@ impl ServerReplicationConfig {
         repl_clients: HashMap<SocketAddr, Arc<Mutex<TcpStream>>>,
         repl_init_done: bool,
         broadcaster: broadcast::Sender<ReplMessage>,
-        sender: mpsc::Sender<usize>,
     ) -> Self {
         ServerReplicationConfig{
             role,
@@ -213,7 +209,7 @@ impl ServerReplicationConfig {
             repl_clients,
             repl_init_done,
             broadcaster,
-            sender,
+            replied_replica: 0
         }
     }
     pub async fn send_to_replicas(&mut self, repl_command: String) -> Result<(), String> {
@@ -235,7 +231,7 @@ struct RequestContext {
     add_repl_client: bool,
     should_send_repl_reply: bool,
     wait_for: Duration,
-    wait_from: Instant,
+    wait_reached: usize,
 }
 
 struct ReplicaConnection {
@@ -268,6 +264,7 @@ impl ReplicaConnection {
                             ReplMessage::Send(message) => {
                                 if message.len() > 0 {
                                     let mut responses = Vec::new();
+                                    
                                     let mut repl_config = server_repl_config.lock().await;
                                     let asbytes = message.chars().map(|s| s as u8).collect::<Vec<u8>>();
                                     // savelater
@@ -277,7 +274,7 @@ impl ReplicaConnection {
                                     responses.push(message.as_bytes().to_vec());
                                     write_response(&mut stream, responses).await.unwrap();
                                 }
-                            }
+                            },
                         }
                     }
                 },
@@ -296,11 +293,10 @@ impl ReplicaConnection {
                                 let rem: Vec<&str> = rem.iter().map(|s| s.as_str()).collect();
                                 match rem.as_slice() {
                                     ["replconf", "ack", number] => {
-                                        let repl_config = server_repl_config.lock().await;
                                         let acked_number = number.parse::<usize>().unwrap_or(0);
-                                        repl_config.sender.send(acked_number).await.unwrap();
                                         self.offset = acked_number;
-                                        println!("acked number {} {}", number, repl_config.master_repl_offset);
+                                        let mut repl_config = server_repl_config.lock().await;
+                                        repl_config.replied_replica = repl_config.replied_replica + 1;
                                     },
                                     _ => ()
                                 }
@@ -328,7 +324,7 @@ impl ConnectionManager {
     }
 
     #[allow(unused_assignments)]
-    async fn process_connection(&self, data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>, receiver: Arc<Mutex<mpsc::Receiver<usize>>>) -> Result<(), String> {
+    async fn process_connection(&self, data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>) -> Result<(), String> {
         loop {
             let mut buffer = [0; BUFFER_SIZE];
             let stream = Arc::clone(&self.stream);
@@ -339,49 +335,44 @@ impl ConnectionManager {
                 .map_err(|e| format!("error code: {}", e))?;
 
             let read_count = stream_guard.read(&mut buffer).await.map_err(|e| format!("error code: {}", e))?;
+            let wait_from = Instant::now();
             if read_count == 0 {
                 break;
             }
 
             let parsed_buffer = parse_client_buffer(&buffer);
+            println!("Elapsed1: {:?}", Instant::now().duration_since(wait_from));
             let _done = for parsed in parsed_buffer {
                 if let Some(command) = parse_command(parsed) {
+                    
                     let mut server_repl_config_ = server_repl_config.lock().await;
+                    
                     let mut data_store_ = data_store.lock().await;
-                    let mut context = process_command(command.clone(), &mut data_store_, &mut server_repl_config_).await;
+                    let context = process_command(command.clone(), &mut data_store_, &mut server_repl_config_).await;
                     drop(server_repl_config_);
 
                     // check if need to wait before send response 
                     if context.wait_for.as_millis() > 0 {
-                        let mut replica_replied: usize = 0;
-                        let mut receiver = receiver.lock().await;
                         'waitfor: loop {
                             let timenow = Instant::now();
                             // stop waiting when timeout reached
-                            if timenow.duration_since(context.wait_from) >= context.wait_for {
-                                break 'waitfor;
-                            }
                             // stop waiting when replica replied count reached current connected replicas
-                            if replica_replied >= server_repl_config.lock().await.repl_clients.len() {
+                            let elapsed = timenow.duration_since(wait_from);
+                            println!("Elapsed2: {:?}", elapsed);
+                            let mut repl_config = server_repl_config.lock().await;
+                            if elapsed >= context.wait_for || repl_config.replied_replica >= context.wait_reached {
+                                println!("Reached {:?} {}",  elapsed, repl_config.replied_replica);
+                                repl_config.replied_replica = 0;
                                 break 'waitfor;
-                            }
-                            // check if any replicas has been replied
-                            if let Some(repl_offset) = receiver.recv().await {
-                                // only update when offset matched
-                                // if server_repl_config.lock().await.master_repl_offset >= repl_offset {
-                                // }
-                                replica_replied = replica_replied + 1;
                             }
                         }
-                        let resp: Vec<Vec<u8>> = vec![integer_resp(replica_replied as i32).as_bytes().to_vec()];
-                        println!("waitfor {:?}", resp);
-                        context.responses = resp;
                     }
 
                     // Process send to client
                     match write_response(&mut stream_guard, context.responses).await {
                         Ok(_) => {
                             if context.add_repl_client {
+                                
                                 let mut server_repl_config_ = server_repl_config.lock().await;
                                 println!("replication client {:?}", self.addr);
                                 server_repl_config_.repl_clients.insert(self.addr, self.stream.clone());
@@ -410,9 +401,8 @@ impl ConnectionManager {
         &mut self, 
         data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>,
         server_repl_config: Arc<Mutex<ServerReplicationConfig>>,
-        receiver: Arc<Mutex<mpsc::Receiver<usize>>>,
     ) -> io::Result<()> {
-        match self.process_connection(data_store, server_repl_config, receiver).await {
+        match self.process_connection(data_store, server_repl_config).await {
             Ok(_) => Ok(()),
             Err(message) => {
                 println!("handle error {}", message);
@@ -480,23 +470,22 @@ async fn handle_repl_handshake(client: &mut TcpStream, bind_port: u16) -> Result
     Ok(())
 }
 
-async fn master_listener_loop(listener: TcpListener, data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>, receiver: Arc<Mutex<mpsc::Receiver<usize>>>) {
+async fn master_listener_loop(listener: TcpListener, data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>) {
     loop {
         let new_connection = listener.accept().await;
         let (stream, client) = new_connection.unwrap();
         let stream = Arc::new(Mutex::new(stream));
         let data_store = data_store.clone();
         let server_repl_config = server_repl_config.clone();
-        let receiver = receiver.clone();
     
         let stream = stream.clone();
         tokio::spawn(async move {
-            ConnectionManager::new(stream, client).handle(data_store, server_repl_config, receiver).await
+            ConnectionManager::new(stream, client).handle(data_store, server_repl_config).await
         });
     }
 }
 
-async fn slave_listener_loop(listener: TcpListener, replication_stream: Arc<Mutex<TcpStream>>, data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>, receiver: Arc<Mutex<mpsc::Receiver<usize>>>) {
+async fn slave_listener_loop(listener: TcpListener, replication_stream: Arc<Mutex<TcpStream>>, data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>) {
     loop {
         // Replication
         let mut client_buffer = [0u8; BUFFER_SIZE];
@@ -507,11 +496,10 @@ async fn slave_listener_loop(listener: TcpListener, replication_stream: Arc<Mute
                 let stream = Arc::new(Mutex::new(stream));
                 let data_store = data_store.clone();
                 let server_repl_config = server_repl_config.clone();
-                let receiver = receiver.clone();
 
                 let stream = stream.clone();
                 tokio::spawn(async move {
-                    ConnectionManager::new(stream, client).handle(data_store, server_repl_config, receiver).await
+                    ConnectionManager::new(stream, client).handle(data_store, server_repl_config).await
                 });
                 
             },
@@ -947,7 +935,7 @@ async fn process_command(
     let mut should_send_repl_reply = false;
     let mut add_repl_client = false;
     let mut wait_for = Duration::from_millis(0);
-    let wait_from = Instant::now();
+    let mut wait_reached = 0;
     let response = match command {
         Command::Ping => {
             simple_resp("PONG")
@@ -1117,9 +1105,10 @@ async fn process_command(
         },
         Command::Wait(com_args) => {
             match com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().as_slice() {
-                [_num_replica, timeout] => {
+                [num_replica, timeout] => {
                     let count = server_repl_config.repl_clients.len();
                     wait_for = Duration::from_millis(timeout.parse::<u64>().unwrap_or(0));
+                    wait_reached = num_replica.parse::<usize>().unwrap_or(0);
                     server_repl_config.send_to_replicas(array_resp(vec!["REPLCONF", "GETACK", "*"])).await.expect("not send");
                     integer_resp(count as i32)
                 },
@@ -1140,6 +1129,6 @@ async fn process_command(
         add_repl_client,
         should_send_repl_reply,
         wait_for,
-        wait_from,
+        wait_reached,
     }
 }
