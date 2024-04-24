@@ -381,6 +381,7 @@ impl ConnectionManager {
                             } else {
                                 false
                             };
+                            println!("repl_config.master_repl_offset == 0 {}, context.wait_reached > repl_config.repl_clients.len() {}, waited_before {}", repl_config.master_repl_offset == 0, context.wait_reached > repl_config.repl_clients.len(), waited_before);
                             if repl_config.master_repl_offset == 0 || context.wait_reached > repl_config.repl_clients.len() || waited_before {
                                 let mod_response = vec![integer_resp(repl_config.repl_clients.len() as i32).as_bytes().to_vec()];
                                 context.responses = mod_response;
