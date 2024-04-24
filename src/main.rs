@@ -215,6 +215,11 @@ impl ServerReplicationConfig {
     pub async fn send_to_replicas(&mut self, repl_command: String) -> Result<(), String> {
         if &self.role == "master" && self.repl_clients.len() > 0 {
             self.broadcaster.send(ReplMessage::Send(repl_command.clone())).expect("can't broadcast");
+            let asbytes = repl_command.chars().map(|s| s as u8).collect::<Vec<u8>>();
+            // savelater
+            if !repl_command.to_lowercase().contains("replconf") && !repl_command.to_ascii_lowercase().contains("getack") {
+                self.master_repl_offset = self.master_repl_offset + asbytes.len();
+            }
         }
         Ok(())
     }
@@ -264,13 +269,6 @@ impl ReplicaConnection {
                             ReplMessage::Send(message) => {
                                 if message.len() > 0 {
                                     let mut responses = Vec::new();
-                                    
-                                    let mut repl_config = server_repl_config.lock().await;
-                                    let asbytes = message.chars().map(|s| s as u8).collect::<Vec<u8>>();
-                                    // savelater
-                                    if !message.to_lowercase().contains("replconf") && !message.to_ascii_lowercase().contains("getack") {
-                                        repl_config.master_repl_offset = repl_config.master_repl_offset + asbytes.len();
-                                    }
                                     responses.push(message.as_bytes().to_vec());
                                     write_response(&mut stream, responses).await.unwrap();
                                 }
@@ -296,7 +294,9 @@ impl ReplicaConnection {
                                         let acked_number = number.parse::<usize>().unwrap_or(0);
                                         self.offset = acked_number;
                                         let mut repl_config = server_repl_config.lock().await;
-                                        repl_config.replied_replica = repl_config.replied_replica + 1;
+                                        if self.offset <= repl_config.master_repl_offset {
+                                            repl_config.replied_replica = repl_config.replied_replica + 1;
+                                        }
                                     },
                                     _ => ()
                                 }
@@ -348,7 +348,7 @@ impl ConnectionManager {
                     let mut server_repl_config_ = server_repl_config.lock().await;
                     
                     let mut data_store_ = data_store.lock().await;
-                    let context = process_command(command.clone(), &mut data_store_, &mut server_repl_config_).await;
+                    let mut context = process_command(command.clone(), &mut data_store_, &mut server_repl_config_).await;
                     drop(server_repl_config_);
 
                     // check if need to wait before send response 
@@ -358,14 +358,29 @@ impl ConnectionManager {
                             // stop waiting when timeout reached
                             // stop waiting when replica replied count reached current connected replicas
                             let elapsed = timenow.duration_since(wait_from);
-                            let mut repl_config = server_repl_config.lock().await;
+                            let repl_config = server_repl_config.lock().await;
                             if elapsed >= context.wait_for || repl_config.replied_replica >= context.wait_reached {
                                 println!("Reached {:?} {}",  elapsed, repl_config.replied_replica);
-                                repl_config.replied_replica = 0;
                                 break 'waitfor;
                             }
                         }
                     }
+
+                    let mut repl_config = server_repl_config.lock().await;
+                    match command {
+                        Command::Wait(_) => {
+                            if context.wait_reached > repl_config.repl_clients.len() {
+                                let mod_response = vec![integer_resp(repl_config.repl_clients.len() as i32).as_bytes().to_vec()];
+                                context.responses = mod_response;
+                            }
+                            repl_config.replied_replica = 0;
+                            if repl_config.role == "master" {
+                                repl_config.master_repl_offset += 37; // len of getack
+                            }
+                        },
+                        _ => ()
+                    }
+                    drop(repl_config);
 
                     // Process send to client
                     match write_response(&mut stream_guard, context.responses).await {
@@ -1105,11 +1120,10 @@ async fn process_command(
         Command::Wait(com_args) => {
             match com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().as_slice() {
                 [num_replica, timeout] => {
-                    let count = server_repl_config.repl_clients.len();
                     wait_for = Duration::from_millis(timeout.parse::<u64>().unwrap_or(0));
                     wait_reached = num_replica.parse::<usize>().unwrap_or(0);
                     server_repl_config.send_to_replicas(array_resp(vec!["REPLCONF", "GETACK", "*"])).await.expect("not send");
-                    integer_resp(count as i32)
+                    integer_resp(wait_reached as i32)
                 },
                 _ => {
                     arg_error_resp("wait")
