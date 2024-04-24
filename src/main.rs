@@ -10,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, Instant};
 
 const DEFAULT_PORT: u16 = 6379;
-const BUFFER_SIZE: usize = 512;
+const BUFFER_SIZE: usize = 1024;
 
 #[tokio::main]
 async fn main() {
@@ -342,9 +342,9 @@ impl ConnectionManager {
                 break;
             }
 
-            let command = parse_req(&buffer);
-            let _done = match command {
-                Some(command) => {
+            let parsed_buffer = parse_client_buffer(&buffer);
+            let _done = for parsed in parsed_buffer {
+                if let Some(command) = parse_command(parsed) {
                     let mut server_repl_config_ = server_repl_config.lock().await;
                     let mut data_store_ = data_store.lock().await;
                     let mut context = process_command(command.clone(), &mut data_store_, &mut server_repl_config_).await;
@@ -374,33 +374,33 @@ impl ConnectionManager {
                             }
                         }
                         let resp: Vec<Vec<u8>> = vec![integer_resp(replica_replied as i32).as_bytes().to_vec()];
+                        println!("waitfor {:?}", resp);
                         context.responses = resp;
                     }
 
                     // Process send to client
-                    let sent = match server_repl_config.lock().await.send_to_client(&context, &mut stream_guard).await {
-                        Ok(_) => Ok(()),
-                        Err(e) => Err(format!("error code {}", e))
-                    };
-                    
-                    if context.add_repl_client {
-                        let mut server_repl_config_ = server_repl_config.lock().await;
-                        println!("replication client {:?}", self.addr);
-                        server_repl_config_.repl_clients.insert(self.addr, self.stream.clone());
-
-                        let stream = self.stream.clone();
-                        let server_repl_config = server_repl_config.clone();
-                        let rx = server_repl_config_.broadcaster.subscribe();
-                        
-                        // moving stream to replica connection
-                        tokio::spawn(async move {
-                            ReplicaConnection::new(stream, rx).handle(server_repl_config).await
-                        });
-                        return Ok(());
+                    match write_response(&mut stream_guard, context.responses).await {
+                        Ok(_) => {
+                            if context.add_repl_client {
+                                let mut server_repl_config_ = server_repl_config.lock().await;
+                                println!("replication client {:?}", self.addr);
+                                server_repl_config_.repl_clients.insert(self.addr, self.stream.clone());
+        
+                                let stream = self.stream.clone();
+                                let server_repl_config = server_repl_config.clone();
+                                let rx = server_repl_config_.broadcaster.subscribe();
+                                
+                                // moving stream to replica connection
+                                tokio::spawn(async move {
+                                    ReplicaConnection::new(stream, rx).handle(server_repl_config).await
+                                });
+                                return Ok(());
+                            }
+                        },
+                        Err(e) => return Err(format!("Can't send response {}", e))
                     }
-                    sent
-                },
-                None => Err("Can't parse command".to_string())
+                    
+                }
             };
         }
         Ok(())
@@ -677,6 +677,109 @@ fn parse_repl_buffer(client_buffer: &[u8; BUFFER_SIZE]) -> ReplBuffer  {
         remaining_buffer,
         rdb_data
     }
+}
+
+fn parse_client_buffer(client_buffer: &[u8; BUFFER_SIZE]) -> Vec<Vec<String>> {
+    let mut buffer_iter = client_buffer.into_iter();
+    let mut parsed_buffer: Vec<Vec<String>> = Vec::new();
+
+    while let Some(buf) = buffer_iter.next() {
+        if *buf == '$' as u8 {
+            let mut raw_bulkstr = String::new();
+            let mut raw_len = String::new();
+            'bulkstr: while let Some(len_) = buffer_iter.next() {
+                if *len_ == '\r' as u8 {
+                    let next_next = buffer_iter.next().unwrap();
+                    if *next_next == '\n' as u8 {
+                        break 'bulkstr;
+                    } else {
+                        break 'bulkstr;
+                    }
+                }
+                raw_len = format!("{}{}", raw_len, *len_ as char);
+            }
+            let len = raw_len.parse::<usize>().unwrap();
+            let mut offset: usize = 0;
+            while offset < len {
+                if let Some(rdb) = buffer_iter.next() {
+                    raw_bulkstr = format!("{}{}", raw_bulkstr, *rdb as char);
+                }
+                offset = offset + 1;
+            }
+            parsed_buffer.push(vec![raw_bulkstr]);
+        } else if *buf == '+' as u8 {
+            // count bytes here
+            let mut simple_str = String::new();
+            'simplestr: while let Some(next) = buffer_iter.next() {
+                if *next == '\r' as u8 {
+                    let next_next = buffer_iter.next().unwrap();
+                    if *next_next == '\n' as u8 {
+                        break 'simplestr;
+                    }
+                    simple_str = format!("{}{}", simple_str, *next as char);
+                    simple_str = format!("{}{}", simple_str, *next_next as char);
+                }
+                simple_str = format!("{}{}", simple_str, *next as char);
+            }
+            parsed_buffer.push(vec![simple_str]);
+        } else if *buf == '*' as u8 {
+            // count bytes here
+            let mut raw_len = String::new();
+            'commandlen: while let Some(next) = buffer_iter.next() {
+                if *next == '\r' as u8 {
+                    let next_next = buffer_iter.next().unwrap();
+                    if *next_next == '\n' as u8 {
+                        break 'commandlen;
+                    }
+                }
+                raw_len = format!("{}{}", raw_len, *next as char);
+            }
+
+            let mut commands: Vec<String> = Vec::new();
+            let com_len = raw_len.parse::<usize>().unwrap_or(0);
+            let mut offset = 0;
+            'comlen: while offset < com_len {
+                if let Some(c) = buffer_iter.next() {
+                    if *c == '\r' as u8 {
+                        let c_next = buffer_iter.next().unwrap();
+                        if *c_next == '\n' as u8 {
+                            continue 'comlen;
+                        }
+                    }
+                    if *c == '$' as u8 {
+                        let mut raw_txtlen = String::new();
+                        'txtlen: while let Some(next) = buffer_iter.next() {
+                            if *next == '\r' as u8 {
+                                let next_next = buffer_iter.next().unwrap();
+                                if *next_next == '\n' as u8 {
+                                    break 'txtlen;
+                                }
+                            }
+                            raw_txtlen = format!("{}{}", raw_txtlen, *next as char);
+                        }
+                        let txtlen = raw_txtlen.parse::<usize>().unwrap_or(0);
+                        let mut parsed_txt = String::new();
+                        'txt: while let Some(t) = buffer_iter.next() {
+                            if *t == '\r' as u8 {
+                                let t_next = buffer_iter.next().unwrap();
+                                if *t_next == '\n' as u8 {
+                                    break 'txt;
+                                }
+                            }
+                            if parsed_txt.len() < txtlen {
+                                parsed_txt = format!("{}{}", parsed_txt, *t as char);
+                            }
+                        }
+                        commands.push(parsed_txt.clone());
+                        offset = offset + 1;
+                    }
+                }
+            }
+            parsed_buffer.push(commands);
+        }
+    }
+
+    parsed_buffer
 }
 
 async fn process_repl_connection(replication_stream: &mut TcpStream, client_buffer: &[u8; BUFFER_SIZE], data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: &mut ServerReplicationConfig) {
@@ -975,11 +1078,11 @@ async fn process_command(
             }
             let mut resp = simple_resp("OK");
             match com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().as_slice() {
-                ["listening-port", port] => {
-                    println!("REPLCONF {} {}", "listening-port", port);
+                ["listening-port", _port] => {
+                    // println!("REPLCONF {} {}", "listening-port", port);
                 }
-                ["capa", capa] => {
-                    println!("REPLCONF {} {}", "capa", capa);
+                ["capa", _capa] => {
+                    // println!("REPLCONF {} {}", "capa", capa);
                 },
                 ["getack", _ack] => {
                     should_send_repl_reply = true;
