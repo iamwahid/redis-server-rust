@@ -217,8 +217,8 @@ impl ServerReplicationConfig {
         }
     }
     pub async fn send_to_replicas(&mut self, repl_command: String) -> Result<(), String> {
-        if &self.role == "master" {
-            self.broadcaster.send(ReplMessage::Send(repl_command.clone())).unwrap();
+        if &self.role == "master" && self.repl_clients.len() > 0 {
+            self.broadcaster.send(ReplMessage::Send(repl_command.clone())).expect("can't broadcast");
         }
         Ok(())
     }
