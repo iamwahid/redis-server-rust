@@ -379,7 +379,7 @@ impl ConnectionManager {
                                     false
                                 }
                             } else {
-                                true
+                                repl_config.master_repl_offset == 0
                             };
                             if context.wait_reached > repl_config.repl_clients.len() || send_repl_len {
                                 let mod_response = vec![integer_resp(repl_config.repl_clients.len() as i32).as_bytes().to_vec()];
