@@ -368,9 +368,9 @@ impl ConnectionManager {
                             // check if any replicas has been replied
                             if let Some(repl_offset) = receiver.recv().await {
                                 // only update when offset matched
-                                if server_repl_config.lock().await.master_repl_offset >= repl_offset {
-                                    replica_replied = replica_replied + 1;
-                                }
+                                // if server_repl_config.lock().await.master_repl_offset >= repl_offset {
+                                // }
+                                replica_replied = replica_replied + 1;
                             }
                         }
                         let resp: Vec<Vec<u8>> = vec![integer_resp(replica_replied as i32).as_bytes().to_vec()];
