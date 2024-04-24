@@ -229,12 +229,13 @@ impl ServerReplicationConfig {
     }
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 struct RequestContext {
     responses: Vec<Vec<u8>>,
     add_repl_client: bool,
     should_send_repl_reply: bool,
     wait_for: Duration,
+    wait_from: Instant,
 }
 
 struct ReplicaConnection {
@@ -352,13 +353,12 @@ impl ConnectionManager {
 
                     // check if need to wait before send response 
                     if context.wait_for.as_millis() > 0 {
-                        let start_time = Instant::now();
                         let mut replica_replied: usize = 0;
                         let mut receiver = receiver.lock().await;
                         'waitfor: loop {
                             let timenow = Instant::now();
                             // stop waiting when timeout reached
-                            if timenow.duration_since(start_time) >= context.wait_for {
+                            if timenow.duration_since(context.wait_from) >= context.wait_for {
                                 break 'waitfor;
                             }
                             // stop waiting when replica replied count reached current connected replicas
@@ -947,6 +947,7 @@ async fn process_command(
     let mut should_send_repl_reply = false;
     let mut add_repl_client = false;
     let mut wait_for = Duration::from_millis(0);
+    let wait_from = Instant::now();
     let response = match command {
         Command::Ping => {
             simple_resp("PONG")
@@ -1139,5 +1140,6 @@ async fn process_command(
         add_repl_client,
         should_send_repl_reply,
         wait_for,
+        wait_from,
     }
 }
