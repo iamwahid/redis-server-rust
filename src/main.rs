@@ -796,6 +796,8 @@ fn parse_req(&buffer: &[u8; BUFFER_SIZE]) -> Option<Command> {
         .take_while(|line| !line.is_empty())
         .collect();
 
+    println!("COMMAND: {:?}", command);
+
     // PARSING
     let command_length = match command.get(0) {
         Some(fi) => {
