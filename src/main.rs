@@ -187,6 +187,7 @@ struct ServerReplicationConfig {
     repl_init_done: bool,
     broadcaster: broadcast::Sender<ReplMessage>,
     replied_replica: usize,
+    last_command: Option<Command>,
 }
 
 impl ServerReplicationConfig {
@@ -209,7 +210,8 @@ impl ServerReplicationConfig {
             repl_clients,
             repl_init_done,
             broadcaster,
-            replied_replica: 0
+            replied_replica: 0,
+            last_command: None
         }
     }
     pub async fn send_to_replicas(&mut self, repl_command: String) -> Result<(), String> {
@@ -368,9 +370,18 @@ impl ConnectionManager {
 
                     let mut repl_config = server_repl_config.lock().await;
                     println!("repl_config.master_repl_offset {}", repl_config.master_repl_offset);
-                    match command {
+                     match command {
                         Command::Wait(_) => {
-                            if repl_config.master_repl_offset == 0 || context.wait_reached > repl_config.repl_clients.len() {
+                            let waited_before = if let Some(last_commmand) = repl_config.last_command.clone() {
+                                if let Command::Wait(_) = last_commmand {
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                            if repl_config.master_repl_offset == 0 || context.wait_reached > repl_config.repl_clients.len() || waited_before {
                                 let mod_response = vec![integer_resp(repl_config.repl_clients.len() as i32).as_bytes().to_vec()];
                                 context.responses = mod_response;
                             }
@@ -386,8 +397,8 @@ impl ConnectionManager {
                     // Process send to client
                     match write_response(&mut stream_guard, context.responses).await {
                         Ok(_) => {
+                            server_repl_config.lock().await.last_command = Some(command.clone());
                             if context.add_repl_client {
-                                
                                 let mut server_repl_config_ = server_repl_config.lock().await;
                                 println!("replication client {:?}", self.addr);
                                 server_repl_config_.repl_clients.insert(self.addr, self.stream.clone());
