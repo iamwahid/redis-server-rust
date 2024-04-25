@@ -17,7 +17,7 @@ async fn main() {
     let data_store: Arc<Mutex<HashMap<String, DataStoreValue>>> =
         Arc::new(Mutex::new(HashMap::new()));
     // parse cli args
-    let parsed = parse_args(env::args());
+    let parsed_args = parse_args(env::args());
 
     let (broadcaster, _) = broadcast::channel::<ReplMessage>(20);
 
@@ -34,15 +34,21 @@ async fn main() {
     );
 
     let mut bind_address = ("127.0.0.1", DEFAULT_PORT);
-    for arg in parsed.into_iter() {
+    for arg in parsed_args.into_iter() {
         match arg {
             ServerArg::Port(port) => {
                 bind_address.1 = port;
-            }
+            },
             ServerArg::ReplicaOf(host, port) => {
                 server_repl_config.role = String::from("slave");
                 server_repl_config.master_host = Some(host);
                 server_repl_config.master_port = Some(port);
+            },
+            ServerArg::Dir(dir) => {
+                server_repl_config.config_dir = Some(dir);
+            },
+            ServerArg::Dbfilename(dbfilename) => {
+                server_repl_config.config_dbfilename = Some(dbfilename);
             }
         }
     }
@@ -144,6 +150,8 @@ fn empty_rdb_and_getack() -> Vec<u8> {
 enum ServerArg {
     Port(u16),
     ReplicaOf(String, u16),
+    Dir(String),
+    Dbfilename(String),
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +170,7 @@ enum Command {
     Replconf(Vec<String>),
     Psync(Vec<String>),
     Wait(Vec<String>),
+    ConfigGet(Vec<String>),
 }
 
 #[derive(Debug)]
@@ -188,6 +197,8 @@ struct ServerReplicationConfig {
     broadcaster: broadcast::Sender<ReplMessage>,
     replied_replica: usize,
     last_command: Option<Command>,
+    config_dir: Option<String>,
+    config_dbfilename: Option<String>,
 }
 
 impl ServerReplicationConfig {
@@ -211,7 +222,9 @@ impl ServerReplicationConfig {
             repl_init_done,
             broadcaster,
             replied_replica: 0,
-            last_command: None
+            last_command: None,
+            config_dir: None,
+            config_dbfilename: None,
         }
     }
     pub async fn send_to_replicas(&mut self, repl_command: String) -> Result<(), String> {
@@ -369,7 +382,6 @@ impl ConnectionManager {
                     }
 
                     let mut repl_config = server_repl_config.lock().await;
-                    println!("repl_config.master_repl_offset {}", repl_config.master_repl_offset);
                      match command {
                         Command::Wait(_) => {
                             let waited_before = if let Some(last_commmand) = repl_config.last_command.clone() {
@@ -381,7 +393,6 @@ impl ConnectionManager {
                             } else {
                                 false
                             };
-                            println!("repl_config.master_repl_offset == 0 {}, context.wait_reached > repl_config.repl_clients.len() {}, waited_before {}", repl_config.master_repl_offset == 0, context.wait_reached > repl_config.repl_clients.len(), waited_before);
                             if repl_config.master_repl_offset == 0 || context.wait_reached > repl_config.repl_clients.len() || waited_before {
                                 let mod_response = vec![integer_resp(repl_config.repl_clients.len() as i32).as_bytes().to_vec()];
                                 context.responses = mod_response;
@@ -876,6 +887,22 @@ fn parse_args(args: Args) -> HashSet<ServerArg> {
                     };
                     parsed_args.insert(ServerArg::ReplicaOf(host, port));
                 }
+                "dir" => {
+                    let dir = if let Some(dir) = args_iter.next() {
+                        dir
+                    } else {
+                        panic!("dir empty");
+                    };
+                    parsed_args.insert(ServerArg::Dir(dir));
+                }
+                "dbfilename" => {
+                    let dbfilename = if let Some(dbfilename) = args_iter.next() {
+                        dbfilename
+                    } else {
+                        panic!("dbfilename empty");
+                    };
+                    parsed_args.insert(ServerArg::Dbfilename(dbfilename));
+                }
                 _ => (),
             }
         } else {
@@ -904,6 +931,17 @@ fn parse_command(mut command_items: Vec<String>) -> Option<Command> {
         ["replconf", args @ ..] => Some(Command::Replconf(str_to_string(args.to_vec()))),
         ["psync", args @ ..] => Some(Command::Psync(str_to_string(args.to_vec()))),
         ["wait", args @ ..] => Some(Command::Wait(str_to_string(args.to_vec()))),
+        ["config", args @ ..] => {
+            match args {
+                ["GET", args @ ..] => {
+                    Some(Command::ConfigGet(str_to_string(args.to_vec())))
+                },
+                ["get", args @ ..] => {
+                    Some(Command::ConfigGet(str_to_string(args.to_vec())))
+                },
+                _ => None
+            }
+        },
         _ => None,
     };
     command
@@ -1144,6 +1182,17 @@ async fn process_command(
                 _ => {
                     arg_error_resp("wait")
                 }
+            }
+        },
+        Command::ConfigGet(com_args) => {
+            match com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().as_slice() {
+                ["dir", _args @ ..] => {
+                    array_resp(vec!["dir", server_repl_config.config_dir.clone().unwrap_or_default().as_str()])
+                },
+                ["dbfilename", _args @ ..] => {
+                    array_resp(vec!["dbfilename", server_repl_config.config_dbfilename.clone().unwrap_or_default().as_str()])
+                },
+                _ => arg_error_resp("config get")
             }
         }
     };
