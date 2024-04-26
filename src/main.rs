@@ -17,7 +17,7 @@ const BUFFER_SIZE: usize = 1024;
 
 #[tokio::main]
 async fn main() {
-    let data_store: Arc<Mutex<HashMap<String, DataStoreValue>>> =
+    let data_store: Arc<Mutex<HashMap<String, DataType>>> =
         Arc::new(Mutex::new(HashMap::new()));
     // parse cli args
     let parsed_args = parse_args(env::args());
@@ -176,12 +176,19 @@ enum Command {
     ConfigGet(Vec<String>),
     Keys(String),
     Type(String),
+    Xadd(Vec<String>),
 }
 
 #[derive(Debug)]
 enum SetExpiry {
     Ex(u64),
     Px(u64),
+}
+
+enum DataType {
+    Set(String, Instant, Option<Duration>),
+    //     id              entry_key, entry_value
+    Stream(HashMap<String, HashMap<String, String>>)
 }
 
 struct DataStoreValue {
@@ -344,7 +351,7 @@ impl ConnectionManager {
     }
 
     #[allow(unused_assignments)]
-    async fn process_connection(&self, data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>) -> Result<(), String> {
+    async fn process_connection(&self, data_store: Arc<Mutex<HashMap<String, DataType>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>) -> Result<(), String> {
         loop {
             let mut buffer = [0; BUFFER_SIZE];
             let stream = Arc::clone(&self.stream);
@@ -445,7 +452,7 @@ impl ConnectionManager {
 
     pub async fn handle(
         &mut self, 
-        data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>,
+        data_store: Arc<Mutex<HashMap<String, DataType>>>,
         server_repl_config: Arc<Mutex<ServerReplicationConfig>>,
     ) -> io::Result<()> {
         match self.process_connection(data_store, server_repl_config).await {
@@ -516,7 +523,7 @@ async fn handle_repl_handshake(client: &mut TcpStream, bind_port: u16) -> Result
     Ok(())
 }
 
-async fn master_listener_loop(listener: TcpListener, data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>) {
+async fn master_listener_loop(listener: TcpListener, data_store: Arc<Mutex<HashMap<String, DataType>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>) {
     loop {
         let new_connection = listener.accept().await;
         let (stream, client) = new_connection.unwrap();
@@ -531,7 +538,7 @@ async fn master_listener_loop(listener: TcpListener, data_store: Arc<Mutex<HashM
     }
 }
 
-async fn slave_listener_loop(listener: TcpListener, replication_stream: Arc<Mutex<TcpStream>>, data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>) {
+async fn slave_listener_loop(listener: TcpListener, replication_stream: Arc<Mutex<TcpStream>>, data_store: Arc<Mutex<HashMap<String, DataType>>>, server_repl_config: Arc<Mutex<ServerReplicationConfig>>) {
     loop {
         // Replication
         let mut client_buffer = [0u8; BUFFER_SIZE];
@@ -816,7 +823,7 @@ fn parse_client_buffer(client_buffer: &[u8; BUFFER_SIZE]) -> Vec<Vec<String>> {
     parsed_buffer
 }
 
-async fn process_repl_connection(replication_stream: &mut TcpStream, client_buffer: &[u8; BUFFER_SIZE], data_store: Arc<Mutex<HashMap<String, DataStoreValue>>>, server_repl_config: &mut ServerReplicationConfig) {
+async fn process_repl_connection(replication_stream: &mut TcpStream, client_buffer: &[u8; BUFFER_SIZE], data_store: Arc<Mutex<HashMap<String, DataType>>>, server_repl_config: &mut ServerReplicationConfig) {
     let mut bytes_processed = server_repl_config.master_repl_offset;
     let mut repl_init_done = server_repl_config.repl_init_done;
 
@@ -966,6 +973,9 @@ fn parse_command(mut command_items: Vec<String>) -> Option<Command> {
                 _ => Some(Command::Type("".to_string()))
             }
         },
+        ["xadd", args @ ..] => {
+            Some(Command::Xadd(str_to_string(args.to_vec())))
+        },
         _ => None,
     };
     command
@@ -1020,7 +1030,7 @@ fn parse_req(&buffer: &[u8; BUFFER_SIZE]) -> Option<Command> {
 // should be save only
 async fn process_command(
     ref mut command: Command,
-    data_store: &mut HashMap<String, DataStoreValue>,
+    data_store: &mut HashMap<String, DataType>,
     server_repl_config: &mut ServerReplicationConfig,
 ) -> RequestContext {
     let mut should_send_repl_init = false;
@@ -1072,22 +1082,14 @@ async fn process_command(
                     };
                     data_store.insert(
                         key.to_string(),
-                        DataStoreValue {
-                            value: value.to_string(),
-                            created_at: Instant::now(),
-                            expired_in: Some(duration),
-                        },
+                        DataType::Set(value.to_string(), Instant::now(), Some(duration)),
                     );
                     (simple_resp("OK"), Some(repl_command))
                 }
                 Some((key, value, None)) => {
                     data_store.insert(
                         key.to_string(),
-                        DataStoreValue {
-                            value: value.to_string(),
-                            created_at: Instant::now(),
-                            expired_in: None,
-                        },
+                        DataType::Set(value.to_string(), Instant::now(), None),
                     );
 
                     let repl_command = array_resp(vec!["SET", &key, &value]);
@@ -1113,20 +1115,20 @@ async fn process_command(
                         } else {
                             null_resp()
                         }
-                    } else if let Some(value) = data_store.get(key) {
+                    } else if let Some(DataType::Set(value, created_at, expires_in)) = data_store.get(key) {
                         if let (Some(elapsed), Some(expired_in)) = (
-                            Instant::now().checked_duration_since(value.created_at),
-                            value.expired_in,
+                            Instant::now().checked_duration_since(*created_at),
+                            *expires_in,
                         ) {
                             if elapsed.as_millis() >= expired_in.as_millis() {
                                 data_store.remove(key);
                                 null_resp()
                             } else {
-                                let value = value.value.clone();
+                                let value = value.clone();
                                 simple_resp(value.as_str())
                             }
                         } else {
-                            let value = value.value.clone();
+                            let value = value.clone();
                             simple_resp(value.as_str())
                         }
                     } else {
@@ -1258,13 +1260,49 @@ async fn process_command(
                 } else {
                     simple_resp("none")
                 }
+                // TODO: add rdb type stream
             } else {
-                if let Some(_) = data_store.get(pattern) {
+                if let Some(DataType::Set(_, _, _)) = data_store.get(pattern) {
                     simple_resp("string")
+                } else if let Some(DataType::Stream(_)) = data_store.get(pattern) {
+                    simple_resp("stream")
                 } else {
                     simple_resp("none")
                 }
             }
+        },
+        Command::Xadd(com_args) => {
+            let mut zipped: HashMap<String, String> = HashMap::new();
+            let mut args_iter = com_args.iter_mut();
+            let mut stream_key_added = false;
+            let mut stream_key = "";
+            let mut id = "";
+            loop {
+                match (args_iter.next(), args_iter.next()) {
+                    (Some(key), Some(value)) => {
+                        if !stream_key_added {
+                            stream_key = key;
+                            id = value;
+                            stream_key_added = true;
+                        } else {
+                            zipped.insert(key.clone(), value.clone());
+                        }
+                    }
+                    (Some(key), None) => {
+                        println!("key {} has no value", key);
+                        break;
+                    }
+                    _ => break
+                }
+            }
+
+            if let Some(DataType::Stream(existing)) = data_store.get_mut(stream_key) {
+                existing.insert(id.to_string(), zipped);
+            } else {
+                let data = DataType::Stream(HashMap::from_iter([(id.to_string(), zipped)]));
+                data_store.insert(stream_key.to_string(), data);
+            }
+            bulk_string_resp(id)
         }
     };
 
