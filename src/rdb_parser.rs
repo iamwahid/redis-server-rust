@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use tokio::fs::File;
@@ -151,14 +152,15 @@ fn match_key(keys: Option<&str>, key: &[u8]) -> bool {
     }
 }
 
-async fn read_type<R: AsyncRead + std::marker::Unpin>(key: &[u8], value_type: u8, reader: &mut R, last_expiretime: &Option<u64>, mut keystore: &mut Vec<String>) -> io::Result<()> {
+async fn read_type<R: AsyncRead + std::marker::Unpin>(key: &[u8], value_type: u8, reader: &mut R, last_expiretime: &Option<u64>, datastore: &mut HashMap<String, String>) -> io::Result<()> {
     match value_type {
         E_STRING => {
-            let _val = read_blob(reader).await.unwrap();
+            let val = read_blob(reader).await.unwrap();
             let parsed_key = key.iter().map(|s| *s as char).collect::<String>();
-            keystore.push(parsed_key.clone());
-            // println!("key => {:?} ", parsed_key);
-            // println!("val => {:?} ", val.iter().map(|s| *s as char).collect::<String>());
+            let parsed_val = val.iter().map(|s| *s as char).collect::<String>();
+            datastore.insert(parsed_key.clone(), parsed_val.clone());
+            println!("key => {:?} ", parsed_key);
+            println!("val => {:?} ", parsed_val);
             // println!("exp => {:?} ", last_expiretime);
         },
         // E_LIST => {
@@ -254,7 +256,7 @@ async fn skip_key_and_object<R: AsyncRead + std::marker::Unpin>(mut reader: &mut
     Ok(())
 }
 
-pub async fn rdb_parser<R: AsyncRead + std::marker::Unpin>(mut reader: &mut R, mut keystore: &mut Vec<String>) -> Result<(), String> {
+pub async fn rdb_parser<R: AsyncRead + std::marker::Unpin>(mut reader: &mut R, mut datastore: &mut HashMap<String, String>, key: Option<&str>) -> Result<(), String> {
     let mut magic = [0u8; 5];
     reader.read(&mut magic).await.expect("Can't parse RDB");
     if MAGIC != magic {
@@ -268,7 +270,7 @@ pub async fn rdb_parser<R: AsyncRead + std::marker::Unpin>(mut reader: &mut R, m
     let mut last_expiretime: Option<u64> = None;
 
     let mut types: Vec<Type> = vec![];
-    let keys: Option<&str> = None;
+    let keys: Option<&str> = key;
 
     loop {
         let next_op = reader.read_u8().await.unwrap();
@@ -312,7 +314,7 @@ pub async fn rdb_parser<R: AsyncRead + std::marker::Unpin>(mut reader: &mut R, m
                 let key = read_blob(&mut reader).await.unwrap();
 
                 if match_type(&mut types, next_op) && match_key(keys, &key) {
-                    read_type(&key, next_op, &mut reader, &last_expiretime, &mut keystore).await.unwrap();
+                    read_type(&key, next_op, &mut reader, &last_expiretime, &mut datastore).await.unwrap();
                 } else {
                     skip_object(&mut reader, next_op).await.unwrap();
                 }
@@ -329,10 +331,10 @@ pub async fn rdb_parser<R: AsyncRead + std::marker::Unpin>(mut reader: &mut R, m
 //     rdb_parser(&mut reader).await
 // }
 
-pub async fn parse_rdb_file(path: String, mut keystore: &mut Vec<String>) -> Result<(), String> {
+pub async fn parse_rdb_file(path: String, mut datastore: &mut HashMap<String, String>, key: Option<&str>) -> Result<(), String> {
     println!("parsing rdb file {}", path);
     let file = File::open(&Path::new(&*path)).await.unwrap();
     let mut reader = BufReader::new(file);
     
-    rdb_parser(&mut reader, &mut keystore).await
+    rdb_parser(&mut reader, &mut datastore, key).await
 }

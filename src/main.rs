@@ -1093,7 +1093,15 @@ async fn process_command(
         Command::Get(com_args) => {
             match com_args.get(0) {
                 Some(key) => {
-                    if let Some(value) = data_store.get(key) {
+                    if let (Some(dir), Some(dbfilename)) = (&server_repl_config.config_dir, &server_repl_config.config_dbfilename) {
+                        let mut datastore = HashMap::new();
+                        rdb_parser::parse_rdb_file(format!("{}/{}", dir, dbfilename), &mut datastore, Some(key)).await.unwrap();
+                        if let Some(val) = datastore.get(key) {
+                            simple_resp(val.as_str())
+                        } else {
+                            null_resp()
+                        }
+                    } else if let Some(value) = data_store.get(key) {
                         if let (Some(elapsed), Some(expired_in)) = (
                             Instant::now().checked_duration_since(value.created_at),
                             value.expired_in,
@@ -1211,9 +1219,13 @@ async fn process_command(
             match pattern.as_str() {
                 "*" => {
                     if let (Some(dir), Some(dbfilename)) = (&server_repl_config.config_dir, &server_repl_config.config_dbfilename) {
-                        let mut keystore = vec![];
-                        rdb_parser::parse_rdb_file(format!("{}/{}", dir, dbfilename), &mut keystore).await.unwrap();
-                        array_resp(keystore.iter().map(|s| s.as_str()).collect::<Vec<&str>>())
+                        let mut datastore = HashMap::new();
+                        rdb_parser::parse_rdb_file(format!("{}/{}", dir, dbfilename), &mut datastore, None).await.unwrap();
+                        let keys : Vec<String> = datastore
+                            .keys()
+                            .into_iter()
+                            .map(|k| k.clone()).collect();
+                        array_resp(keys.iter().map(|s| s.as_str()).collect::<Vec<&str>>())
                     } else {
                         array_resp(vec![])
                     }
