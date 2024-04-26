@@ -1,3 +1,6 @@
+mod rdb_parser;
+
+use std::io;
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::net::SocketAddr;
@@ -5,7 +8,7 @@ use std::num::ParseIntError;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::{env, env::Args};
 use tokio::sync::{broadcast, Mutex};
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{BufReader, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, Instant};
 
@@ -171,6 +174,7 @@ enum Command {
     Psync(Vec<String>),
     Wait(Vec<String>),
     ConfigGet(Vec<String>),
+    Keys(String),
 }
 
 #[derive(Debug)]
@@ -942,6 +946,14 @@ fn parse_command(mut command_items: Vec<String>) -> Option<Command> {
                 _ => None
             }
         },
+        ["keys", args @ ..] => {
+            match args {
+                ["*"] => {
+                    Some(Command::Keys("*".to_string()))
+                },
+                _ => None
+            }
+        },
         _ => None,
     };
     command
@@ -1193,6 +1205,20 @@ async fn process_command(
                     array_resp(vec!["dbfilename", server_repl_config.config_dbfilename.clone().unwrap_or_default().as_str()])
                 },
                 _ => arg_error_resp("config get")
+            }
+        },
+        Command::Keys(pattern) => {
+            match pattern.as_str() {
+                "*" => {
+                    if let (Some(dir), Some(dbfilename)) = (&server_repl_config.config_dir, &server_repl_config.config_dbfilename) {
+                        let mut keystore = vec![];
+                        rdb_parser::parse_rdb_file(format!("./{}/{}", dir, dbfilename), &mut keystore).await.unwrap();
+                        array_resp(keystore.iter().map(|s| s.as_str()).collect::<Vec<&str>>())
+                    } else {
+                        array_resp(vec![])
+                    }
+                },
+                _ => arg_error_resp("keys")
             }
         }
     };
