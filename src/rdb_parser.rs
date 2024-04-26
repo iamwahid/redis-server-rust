@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::time::SystemTime;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 
@@ -158,10 +159,21 @@ async fn read_type<R: AsyncRead + std::marker::Unpin>(key: &[u8], value_type: u8
             let val = read_blob(reader).await.unwrap();
             let parsed_key = key.iter().map(|s| *s as char).collect::<String>();
             let parsed_val = val.iter().map(|s| *s as char).collect::<String>();
-            datastore.insert(parsed_key.clone(), parsed_val.clone());
             println!("key => {:?} ", parsed_key);
             println!("val => {:?} ", parsed_val);
-            // println!("exp => {:?} ", last_expiretime);
+            println!("exp => {:?} ", last_expiretime);
+            if let Some(exp) = last_expiretime {
+                match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+                    Ok(n) => {
+                        if *exp as u128 > n.as_millis() {
+                            datastore.insert(parsed_key.clone(), parsed_val.clone());
+                        }
+                    },
+                    Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+                }
+            } else {
+                datastore.insert(parsed_key.clone(), parsed_val.clone());
+            }
         },
         // E_LIST => {
         //     try!(self.read_linked_list(key, Type::List))
