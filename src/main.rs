@@ -1212,7 +1212,7 @@ async fn process_command(
                 "*" => {
                     if let (Some(dir), Some(dbfilename)) = (&server_repl_config.config_dir, &server_repl_config.config_dbfilename) {
                         let mut keystore = vec![];
-                        rdb_parser::parse_rdb_file(format!("./{}/{}", dir, dbfilename), &mut keystore).await.unwrap();
+                        rdb_parser::parse_rdb_file(format!("{}/{}", dir, dbfilename), &mut keystore).await.unwrap();
                         array_resp(keystore.iter().map(|s| s.as_str()).collect::<Vec<&str>>())
                     } else {
                         array_resp(vec![])
