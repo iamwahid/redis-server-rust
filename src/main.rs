@@ -175,6 +175,7 @@ enum Command {
     Wait(Vec<String>),
     ConfigGet(Vec<String>),
     Keys(String),
+    Type(String),
 }
 
 #[derive(Debug)]
@@ -951,7 +952,18 @@ fn parse_command(mut command_items: Vec<String>) -> Option<Command> {
                 ["*"] => {
                     Some(Command::Keys("*".to_string()))
                 },
-                _ => None
+                [s] => {
+                    Some(Command::Keys(s.to_string()))
+                },
+                _ => Some(Command::Keys("".to_string()))
+            }
+        },
+        ["type", args @ ..] => {
+            match args {
+                [key] => {
+                    Some(Command::Type(key.to_string()))
+                },
+                _ => Some(Command::Type("".to_string()))
             }
         },
         _ => None,
@@ -1231,6 +1243,27 @@ async fn process_command(
                     }
                 },
                 _ => arg_error_resp("keys")
+            }
+        }
+        Command::Type(pattern) => {
+            if let (Some(dir), Some(dbfilename)) = (&server_repl_config.config_dir, &server_repl_config.config_dbfilename) {
+                let mut datastore = HashMap::new();
+                rdb_parser::parse_rdb_file(format!("{}/{}", dir, dbfilename), &mut datastore, Some(&pattern)).await.unwrap();
+                let keys : Vec<String> = datastore
+                    .keys()
+                    .into_iter()
+                    .map(|k| k.clone()).collect();
+                if keys.len() > 0 {
+                    simple_resp("string")
+                } else {
+                    simple_resp("none")
+                }
+            } else {
+                if let Some(_) = data_store.get(pattern) {
+                    simple_resp("string")
+                } else {
+                    simple_resp("none")
+                }
             }
         }
     };
