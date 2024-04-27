@@ -1036,6 +1036,7 @@ fn parse_xread_stream_command(args: &[&str], data_store: &mut HashMap<String, Da
             let key_and_id: Vec<&[&str]> = args.chunks(args.len() / 2).collect();
             let key_id_pairs: Vec<(&&str, &&str)> = zip(key_and_id[0], key_and_id[1]).collect();
             let mut has_invalid_arg = false;
+            let mut has_matching_stream_id = true;
             let mut filtered_data = vec![];
             for (key, id) in key_id_pairs {
                 let start_id = StreamId::try_from(*id);
@@ -1049,8 +1050,12 @@ fn parse_xread_stream_command(args: &[&str], data_store: &mut HashMap<String, Da
                             let mut inner_data = vec![];
                             'inner: for (stream_id, data) in sorted {
                                 let mut subitem = vec![];
-                                if start_id > *stream_id {
+                                // println!("{:?} - {:?}", *stream_id, start_id);
+                                if *stream_id <= start_id {
+                                    has_matching_stream_id = false;
                                     continue 'inner;
+                                } else {
+                                    has_matching_stream_id = true;
                                 }
 
                                 for (subk, subv) in data {
@@ -1073,7 +1078,7 @@ fn parse_xread_stream_command(args: &[&str], data_store: &mut HashMap<String, Da
             }
             if has_invalid_arg {
                 Err(simple_error_resp("ERR Invalid stream ID specified as stream command argument"))
-            } else if filtered_data.len() == 0 {
+            } else if filtered_data.len() == 0 || !has_matching_stream_id {
                 Err(array_nested_resp(vec![]))
             } else {
                 let nested_response = filtered_data.iter_mut().map(|s| s.as_str()).collect();
