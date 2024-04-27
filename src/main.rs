@@ -1426,7 +1426,7 @@ async fn process_command(
                 (Some((last_id, existing)), Some(XaddIdPattern::Auto)) => {
                     let mut new_id = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
                         Ok(n) => {
-                            StreamId{ms: n.as_micros(), seq: 0}
+                            StreamId{ms: n.as_millis(), seq: 0}
                         },
                         Err(_) => panic!("SystemTime before UNIX EPOCH!"),
                     };
@@ -1445,7 +1445,7 @@ async fn process_command(
                 (None, Some(XaddIdPattern::Auto)) => {
                     let new_id = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
                         Ok(n) => {
-                            StreamId{ms: n.as_micros(), seq: 0}
+                            StreamId{ms: n.as_millis(), seq: 0}
                         },
                         Err(_) => panic!("SystemTime before UNIX EPOCH!"),
                     };
