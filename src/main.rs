@@ -471,7 +471,7 @@ impl ConnectionManager {
                                 }
                             },
                             Command::Xread(_) => {
-                                let mut resp = array_resp(vec![]);
+                                let mut resp = null_resp();
                                 'waitfor: loop {
                                     let timenow = Instant::now();
                                     let elapsed = timenow.duration_since(wait_from);
@@ -1079,7 +1079,7 @@ fn parse_xread_stream_command(args: &[&str], data_store: &mut HashMap<String, Da
             if has_invalid_arg {
                 Err(simple_error_resp("ERR Invalid stream ID specified as stream command argument"))
             } else if filtered_data.len() == 0 || !has_matching_stream_id {
-                Err(array_nested_resp(vec![]))
+                Err(null_resp())
             } else {
                 let nested_response = filtered_data.iter_mut().map(|s| s.as_str()).collect();
                 let nested_response = array_nested_resp(nested_response);
