@@ -7,6 +7,7 @@ use std::iter::zip;
 use std::net::SocketAddr;
 use std::num::ParseIntError;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::SystemTime;
 use std::{env, env::Args};
 use tokio::sync::{broadcast, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1348,18 +1349,22 @@ async fn process_command(
                 None
             };
 
-            println!("{:?}", valid_pattern);
-
             match (last_id, valid_pattern) {
                 (Some((last_id, _existing)), Some(XaddIdPattern::Auto)) => {
                     // todo
                     bulk_string_resp(last_id.as_str())
                 },
                 (None, Some(XaddIdPattern::Auto)) => {
-                    // todo
-                    // let data = DataType::Stream(HashMap::from_iter([(id.to_string(), zipped.clone())]));
-                    // data_store.insert(stream_key.to_string(), data);
-                    bulk_string_resp(id)
+                    let new_id = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+                        Ok(n) => {
+                            format!("{}-0", n.as_millis())
+                        },
+                        Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+                    };
+
+                    let data = DataType::Stream(HashMap::from_iter([(new_id.clone(), zipped.clone())]));
+                    data_store.insert(stream_key.to_string(), data);
+                    bulk_string_resp(&new_id)
                 },
                 (Some((last_id, existing)), Some(XaddIdPattern::PartialAuto(new_id))) => {
                     let nnew_id = if new_id.as_str() == "0" {
