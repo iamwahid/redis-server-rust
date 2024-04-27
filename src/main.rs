@@ -1359,7 +1359,11 @@ async fn process_command(
                     bulk_string_resp(id)
                 },
                 (Some((last_id, existing)), Some(XaddIdPattern::PartialAuto(new_id))) => {
-                    let nnew_id = format!("{}-0", new_id);
+                    let nnew_id = if new_id.as_str() == "0" {
+                        format!("{}-1", new_id)
+                    } else {
+                        format!("{}-0", new_id)
+                    };
                     let vlast_id: Vec<_> = last_id.split("-").collect();
                     let vnew_id: Vec<_> = nnew_id.split("-").collect();
                     let zipid: Vec<_> = zip(vlast_id, vnew_id).collect();
@@ -1384,7 +1388,12 @@ async fn process_command(
                     }
                 },
                 (None, Some(XaddIdPattern::PartialAuto(new_id))) => {
-                    let new_id = format!("{}-0", new_id);
+                    let new_id = if new_id.as_str() == "0" {
+                        format!("{}-1", new_id)
+                    } else {
+                        format!("{}-0", new_id)
+                    };
+                    
                     let data = DataType::Stream(HashMap::from_iter([(new_id.clone(), zipped.clone())]));
                     data_store.insert(stream_key.to_string(), data);
                     bulk_string_resp(new_id.as_str())
@@ -1410,9 +1419,13 @@ async fn process_command(
                     }
                 },
                 (None, Some(XaddIdPattern::Manual(new_id))) => {
-                    let data = DataType::Stream(HashMap::from_iter([(new_id.clone(), zipped.clone())]));
-                    data_store.insert(stream_key.to_string(), data);
-                    bulk_string_resp(new_id.as_str())
+                    if new_id == "0-0" {
+                        simple_error_resp("ERR The ID specified in XADD must be greater than 0-0")
+                    } else {
+                        let data = DataType::Stream(HashMap::from_iter([(new_id.clone(), zipped.clone())]));
+                        data_store.insert(stream_key.to_string(), data);
+                        bulk_string_resp(new_id.as_str())
+                    }
                 },
                 _ => simple_error_resp("ERR Invalid stream ID specified as stream command argument")
             }
