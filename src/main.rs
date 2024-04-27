@@ -338,6 +338,7 @@ struct RequestContext {
     should_send_repl_reply: bool,
     wait_for: Duration,
     wait_reached: usize,
+    xread_args: Vec<String>,
 }
 
 struct ReplicaConnection {
@@ -451,19 +452,49 @@ impl ConnectionManager {
                     let mut data_store_ = data_store.lock().await;
                     let mut context = process_command(command.clone(), &mut data_store_, &mut server_repl_config_).await;
                     drop(server_repl_config_);
+                    drop(data_store_);
 
                     // check if need to wait before send response 
                     if context.wait_for.as_millis() > 0 {
-                        'waitfor: loop {
-                            let timenow = Instant::now();
-                            // stop waiting when timeout reached
-                            // stop waiting when replica replied count reached current connected replicas
-                            let elapsed = timenow.duration_since(wait_from);
-                            let repl_config = server_repl_config.lock().await;
-                            if elapsed >= context.wait_for || repl_config.replied_replica >= context.wait_reached {
-                                println!("Reached {:?} {}",  elapsed, repl_config.replied_replica);
-                                break 'waitfor;
-                            }
+                        match command.clone() {
+                            Command::Wait(_) => {
+                                'waitfor: loop {
+                                    let timenow = Instant::now();
+                                    // stop waiting when timeout reached
+                                    // stop waiting when replica replied count reached current connected replicas
+                                    let elapsed = timenow.duration_since(wait_from);
+                                    let repl_config = server_repl_config.lock().await;
+                                    if elapsed >= context.wait_for || repl_config.replied_replica >= context.wait_reached {
+                                        println!("Reached {:?} {}",  elapsed, repl_config.replied_replica);
+                                        break 'waitfor;
+                                    }
+                                }
+                            },
+                            Command::Xread(_) => {
+                                let mut resp = array_resp(vec![]);
+                                'waitfor: loop {
+                                    let timenow = Instant::now();
+                                    let elapsed = timenow.duration_since(wait_from);
+                                    let mut inner_data_store = data_store.lock().await;
+                                    let xread_args = context.xread_args.clone();
+                                    let xread_args = xread_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+                                    
+                                    match parse_xread_stream_command(xread_args.as_slice(), &mut inner_data_store) {
+                                        Ok(xread_resp) => {
+                                            resp = xread_resp;
+                                            break 'waitfor;
+                                        },
+                                        _ => ()
+                                    }
+
+                                    if elapsed >= context.wait_for {
+                                        break 'waitfor;
+                                    }
+                                }
+                                let mod_response = vec![resp.as_bytes().to_vec()];
+                                context.responses = mod_response;
+                            },
+                            _ => ()
                         }
                     }
 
@@ -998,6 +1029,61 @@ fn parse_args(args: Args) -> HashSet<ServerArg> {
     parsed_args
 }
 
+fn parse_xread_stream_command(args: &[&str], data_store: &mut HashMap<String, DataType>) -> Result<String, String> {
+    let args_len = args.len() % 2;
+    match args_len {
+        0 => {
+            let key_and_id: Vec<&[&str]> = args.chunks(args.len() / 2).collect();
+            let key_id_pairs: Vec<(&&str, &&str)> = zip(key_and_id[0], key_and_id[1]).collect();
+            let mut has_invalid_arg = false;
+            let mut filtered_data = vec![];
+            for (key, id) in key_id_pairs {
+                let start_id = StreamId::try_from(*id);
+                if let Some(start_id) = start_id {
+                    if data_store.contains_key(*key) {
+                        if let Some(DataType::Stream(entries)) = data_store.get_mut(*key) {
+                            let presorted = entries.clone();
+                            let mut sorted: Vec<_> = presorted.iter().collect();
+                            sorted.sort_by_key(|a| a.0);
+                            
+                            let mut inner_data = vec![];
+                            'inner: for (stream_id, data) in sorted {
+                                let mut subitem = vec![];
+                                if start_id > *stream_id {
+                                    continue 'inner;
+                                }
+
+                                for (subk, subv) in data {
+                                    subitem.push(subk.as_str());
+                                    subitem.push(subv.as_str());
+                                }
+                                let item_resp = array_nested_xrange_resp(stream_id.to_string().as_str(), subitem);
+                                inner_data.push(item_resp);
+                            }
+                            let inner_data = inner_data.iter_mut().map(|s| s.as_str()).collect();
+                            let mut nested_stream = vec![bulk_string_resp(key), array_nested_resp(inner_data)];
+                            let nested_stream = nested_stream.iter_mut().map(|s| s.as_str()).collect();
+                            filtered_data.push(array_nested_resp(nested_stream));
+                        }
+                    }
+                } else {
+                    has_invalid_arg = true;
+                    break;
+                }
+            }
+            if has_invalid_arg {
+                Err(simple_error_resp("ERR Invalid stream ID specified as stream command argument"))
+            } else if filtered_data.len() == 0 {
+                Err(array_nested_resp(vec![]))
+            } else {
+                let nested_response = filtered_data.iter_mut().map(|s| s.as_str()).collect();
+                let nested_response = array_nested_resp(nested_response);
+                Ok(nested_response)
+            }
+        },
+        _ => Err(simple_error_resp("ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified."))
+    }
+}
 
 fn parse_command(mut command_items: Vec<String>) -> Option<Command> {
     if let Some(first) = command_items.first_mut() {
@@ -1118,10 +1204,11 @@ async fn process_command(
     let mut add_repl_client = false;
     let mut wait_for = Duration::from_millis(0);
     let mut wait_reached = 0;
+    let mut xread_args: Vec<String> = vec![];
     let response = match command {
         Command::Ping => {
             simple_resp("PONG")
-        }
+        },
         Command::Echo(com_args) => {
             match com_args.get(0) {
                 Some(message) => {
@@ -1131,7 +1218,7 @@ async fn process_command(
                     arg_error_resp("echo")
                 }
             }
-        }
+        },
         Command::Set(com_args) => {
             let com_args = com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
             let parsed_option = match com_args.as_slice() {
@@ -1183,7 +1270,7 @@ async fn process_command(
                 server_repl_config.send_to_replicas(repl).await.expect("not send");
             }
             resp
-        }
+        },
         Command::Get(com_args) => {
             match com_args.get(0) {
                 Some(key) => {
@@ -1219,7 +1306,7 @@ async fn process_command(
                     arg_error_resp("get")
                 }
             }
-        }
+        },
         Command::Info(com_args) => {
             match com_args.get(0) {
                 Some(info_type) => {
@@ -1242,7 +1329,7 @@ async fn process_command(
                     arg_error_resp("info") // TODO: not supported yet
                 }
             }
-        }
+        },
         Command::Replconf(ref mut com_args) => {
             if let Some(first) = com_args.first_mut() {
                 *first = first.to_ascii_lowercase();
@@ -1262,7 +1349,7 @@ async fn process_command(
                 _ => (),
             };
             resp
-        }
+        },
         Command::Psync(com_args) => {
             let repl_config = server_repl_config;
             match com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().as_slice() {
@@ -1326,7 +1413,7 @@ async fn process_command(
                 },
                 _ => arg_error_resp("keys")
             }
-        }
+        },
         Command::Type(pattern) => {
             if let (Some(dir), Some(dbfilename)) = (&server_repl_config.config_dir, &server_repl_config.config_dbfilename) {
                 let mut datastore = HashMap::new();
@@ -1574,62 +1661,20 @@ async fn process_command(
                 *first = first.to_lowercase();
             }
             let args = com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
-            match args.as_slice() {
+            let resp = match args.as_slice() {
+                ["block", wait_millis, "streams", args @ ..] => {
+                    let wait_millis = wait_millis.parse::<u64>().unwrap();
+                    let wait_millis = Duration::from_millis(wait_millis);
+                    wait_for = wait_millis;
+                    xread_args = args.to_vec().into_iter().map(|s| s.to_string()).collect::<Vec<String>>();
+                    null_resp()
+                },
                 ["streams", args @ ..] => {
-                    let args_len = args.len() % 2;
-                    match args_len {
-                        0 => {
-                            let key_and_id: Vec<&[&str]> = args.chunks(args.len() / 2).collect();
-                            let key_id_pairs: Vec<(&&str, &&str)> = zip(key_and_id[0], key_and_id[1]).collect();
-                            let mut has_invalid_arg = false;
-                            let mut filtered_data = vec![];
-                            for (key, id) in key_id_pairs {
-                                let start_id = StreamId::try_from(*id);
-                                if let Some(start_id) = start_id {
-                                    if data_store.contains_key(*key) {
-                                        if let Some(DataType::Stream(entries)) = data_store.get_mut(*key) {
-                                            let presorted = entries.clone();
-                                            let mut sorted: Vec<_> = presorted.iter().collect();
-                                            sorted.sort_by_key(|a| a.0);
-                                            
-                                            let mut inner_data = vec![];
-                                            'inner: for (stream_id, data) in sorted {
-                                                let mut subitem = vec![];
-                                                if start_id > *stream_id {
-                                                    continue 'inner;
-                                                }
-
-                                                for (subk, subv) in data {
-                                                    subitem.push(subk.as_str());
-                                                    subitem.push(subv.as_str());
-                                                }
-                                                let item_resp = array_nested_xrange_resp(stream_id.to_string().as_str(), subitem);
-                                                inner_data.push(item_resp);
-                                            }
-                                            let inner_data = inner_data.iter_mut().map(|s| s.as_str()).collect();
-                                            let mut nested_stream = vec![bulk_string_resp(key), array_nested_resp(inner_data)];
-                                            let nested_stream = nested_stream.iter_mut().map(|s| s.as_str()).collect();
-                                            filtered_data.push(array_nested_resp(nested_stream));
-                                        }
-                                    }
-                                } else {
-                                    has_invalid_arg = true;
-                                    break;
-                                }
-                            }
-                            let nested_response = filtered_data.iter_mut().map(|s| s.as_str()).collect();
-                            let nested_response = array_nested_resp(nested_response);
-                            if has_invalid_arg {
-                                simple_error_resp("ERR Invalid stream ID specified as stream command argument")
-                            } else {
-                                nested_response
-                            }
-                        },
-                        _ => simple_error_resp("ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.")
-                    }
+                    parse_xread_stream_command(args, data_store).unwrap()
                 },
                 _ => arg_error_resp("xread")
-            }
+            };
+            resp
         }
     };
 
@@ -1644,5 +1689,6 @@ async fn process_command(
         should_send_repl_reply,
         wait_for,
         wait_reached,
+        xread_args,
     }
 }
