@@ -180,6 +180,7 @@ enum Command {
     Xadd(Vec<String>),
 }
 
+#[derive(Debug, Clone)]
 enum XaddIdPattern {
     Auto,
     PartialAuto(String),
@@ -1347,6 +1348,8 @@ async fn process_command(
                 None
             };
 
+            println!("{:?}", valid_pattern);
+
             match (last_id, valid_pattern) {
                 (Some((last_id, _existing)), Some(XaddIdPattern::Auto)) => {
                     // todo
@@ -1370,9 +1373,7 @@ async fn process_command(
                     let first = zipid.first().unwrap();
                     let last = zipid.last().unwrap();
 
-                    if let Some(_) = existing.get(&nnew_id) {
-                        simple_error_resp("ERR The ID specified in XADD is equal or smaller than the target stream top item")
-                    } else if first.0 == first.1 {
+                    if first.0 == first.1 {
                         let last_sub_id = last.0.parse::<u64>().unwrap();
                         let new_id = format!("{}-{}", first.0, last_sub_id + 1);
                         existing.insert(new_id.clone(), zipped.clone());
