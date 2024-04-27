@@ -120,6 +120,23 @@ fn array_resp(messages: Vec<&str>) -> String {
     resp
 }
 
+fn array_nested_resp(messages: Vec<&str>) -> String {
+    let mut resp = format!("*{}\r\n", messages.len());
+    for message in messages.into_iter() {
+        resp = format!("{}{}", resp, message);
+    }
+    resp
+}
+
+fn array_nested_xrange_resp(first_element: &str, messages: Vec<&str>) -> String {
+    let mut second_element = format!("*{}\r\n", messages.len());
+    for message in messages.into_iter() {
+        second_element = format!("{}{}", second_element, bulk_string_resp(message));
+    }
+    let resp = format!("*{}\r\n{}{}", 2, bulk_string_resp(first_element), second_element);
+    resp
+}
+
 fn integer_resp(num: i32) -> String {
     format!(":{}\r\n", num)
 }
@@ -179,6 +196,7 @@ enum Command {
     Keys(String),
     Type(String),
     Xadd(Vec<String>),
+    Xrange(Vec<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -979,6 +997,9 @@ fn parse_command(mut command_items: Vec<String>) -> Option<Command> {
         ["xadd", args @ ..] => {
             Some(Command::Xadd(str_to_string(args.to_vec())))
         },
+        ["xrange", args @ ..] => {
+            Some(Command::Xrange(str_to_string(args.to_vec())))
+        },
         _ => None,
     };
     command
@@ -1350,9 +1371,31 @@ async fn process_command(
             };
 
             match (last_id, valid_pattern) {
-                (Some((last_id, _existing)), Some(XaddIdPattern::Auto)) => {
-                    // todo
-                    bulk_string_resp(last_id.as_str())
+                (Some((last_id, existing)), Some(XaddIdPattern::Auto)) => {
+                    let new_id = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+                        Ok(n) => {
+                            format!("{}-0", n.as_millis())
+                        },
+                        Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+                    };
+                    let vlast_id: Vec<u64> = last_id.split("-").map(|s| s.parse::<u64>().unwrap_or(0)).collect();
+                    let vnew_id: Vec<u64> = new_id.split("-").map(|s| s.parse::<u64>().unwrap_or(0)).collect();
+                    let zipid: Vec<_> = zip(vlast_id, vnew_id).collect();
+                    let first = zipid.first().unwrap();
+                    let last = zipid.last().unwrap();
+                    if first.0 == first.1 {
+                        let new_id = format!("{}-{}", first.0, last.0 + 1);
+                        existing.insert(new_id.clone(), zipped.clone());
+                        bulk_string_resp(new_id.as_str())
+                    } else if first.0 > first.1 {
+                        simple_error_resp("ERR The ID specified in XADD is equal or smaller than the target stream top item")
+                    } else if first.0 < first.1 {
+                        existing.insert(new_id.clone(), zipped.clone());
+                        bulk_string_resp(new_id.as_str())
+                    } else {
+                        existing.insert(new_id.clone(), zipped.clone());
+                        bulk_string_resp(&new_id)
+                    }
                 },
                 (None, Some(XaddIdPattern::Auto)) => {
                     let new_id = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
@@ -1361,7 +1404,6 @@ async fn process_command(
                         },
                         Err(_) => panic!("SystemTime before UNIX EPOCH!"),
                     };
-
                     let data = DataType::Stream(HashMap::from_iter([(new_id.clone(), zipped.clone())]));
                     data_store.insert(stream_key.to_string(), data);
                     bulk_string_resp(&new_id)
@@ -1434,6 +1476,41 @@ async fn process_command(
                     }
                 },
                 _ => simple_error_resp("ERR Invalid stream ID specified as stream command argument")
+            }
+        },
+        Command::Xrange(com_args) => {
+            match com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().as_slice() {
+                [key, start, end] => {
+                    if let Some(DataType::Stream(entries)) = data_store.get_mut(*key) {
+                        let start = start.parse::<u64>().unwrap();
+                        let end = end.parse::<u64>().unwrap();
+                        let presorted = entries.clone();
+                        let mut sorted: Vec<_> = presorted.iter().collect();
+                        sorted.sort_by_key(|a| a.0);
+                        let mut data = vec![];
+                        for (k, d) in sorted {
+                            let mut subitem = vec![];
+                            let subs = k.split("-").map(|s| s.parse::<u64>().unwrap()).collect::<Vec<u64>>();
+                            let sub_id = subs.first().unwrap();
+
+                            if !(start <= *sub_id && *sub_id <= end) {
+                                continue;
+                            }
+                            
+                            for (subk, subv) in d {
+                                subitem.push(subk.as_str());
+                                subitem.push(subv.as_str());
+                            }
+                            let item_resp = array_nested_xrange_resp(k.as_str(), subitem);
+                            data.push(item_resp);
+                        }
+                        let data = data.iter_mut().map(|s| s.as_str()).collect();
+                        array_nested_resp(data)
+                    } else {
+                        array_resp(vec![])
+                    }
+                },
+                _ => arg_error_resp("xrange")
             }
         }
     };
