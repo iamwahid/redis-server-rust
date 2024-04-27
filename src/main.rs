@@ -202,8 +202,60 @@ enum Command {
 #[derive(Debug, Clone)]
 enum XaddIdPattern {
     Auto,
-    PartialAuto(String),
-    Manual(String)
+    PartialAuto(u128),
+    Manual(StreamId)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+struct StreamId {
+    ms: u128,
+    seq: usize,
+}
+
+impl StreamId {
+    pub fn try_from(from_str: &str) -> Option<StreamId> {
+        let id: Vec<&str> = from_str.split("-").collect();
+        let new_id = match (id.get(0), id.get(1)) {
+            (Some(ms), Some(seq)) => {
+                match (ms.parse::<u128>(), seq.parse::<usize>()) {
+                    (Ok(ms), Ok(seq)) => {
+                        Some(StreamId{ms, seq})
+                    },
+                    _ => {
+                        None
+                    }
+                }
+            },
+            (Some(ms), None) => {
+                match ms.parse::<u128>() {
+                    Ok(ms) => Some(StreamId{ms, seq:0}),
+                    Err(_) => None
+                }
+            },
+            _ => None
+        };
+        new_id
+    }
+
+    pub fn min() -> StreamId {
+        StreamId{
+            ms: 0,
+            seq: 0,
+        }
+    }
+
+    pub fn max() -> StreamId {
+        StreamId{
+            ms: u128::MAX,
+            seq: usize::MAX,
+        }
+    }
+}
+
+impl ToString for StreamId {
+    fn to_string(&self) -> String {
+        format!("{}-{}", self.ms, self.seq)
+    }
 }
 
 #[derive(Debug)]
@@ -215,7 +267,7 @@ enum SetExpiry {
 enum DataType {
     Set(String, Instant, Option<Duration>),
     //     id              entry_key, entry_value
-    Stream(HashMap<String, HashMap<String, String>>)
+    Stream(HashMap<StreamId, HashMap<String, String>>)
 }
 
 #[derive(Debug)]
@@ -1324,21 +1376,21 @@ async fn process_command(
             let valid_pattern = match ids.as_slice() {
                 ["*"] => Some(XaddIdPattern::Auto),
                 [id1] => {
-                    if let Err(_) = id1.parse::<u64>() {
-                        None
+                    if let Ok(parsed) = id1.parse::<u128>() {
+                        Some(XaddIdPattern::PartialAuto(parsed))
                     } else {
-                        Some(XaddIdPattern::PartialAuto(id1.to_string()))
+                        None
                     }
                 },
                 [id1, "*"] => {
-                    if let Err(_) = id1.parse::<u64>() {
-                        None
+                    if let Ok(parsed) = id1.parse::<u128>() {
+                        Some(XaddIdPattern::PartialAuto(parsed))
                     } else {
-                        Some(XaddIdPattern::PartialAuto(id1.to_string()))
+                        None
                     }
                 },
                 [id1, id2] => {
-                    match (id1.parse::<u64>(), id2.parse::<u64>()) {
+                    match (id1.parse::<u128>(), id2.parse::<usize>()) {
                         (Err(_), Err(_)) => {
                             None
                         },
@@ -1349,7 +1401,7 @@ async fn process_command(
                             None
                         },
                         (Ok(id1), Ok(id2)) => {
-                            Some(XaddIdPattern::Manual(format!("{}-{}", id1, id2)))
+                            Some(XaddIdPattern::Manual(StreamId{ms: id1, seq: id2}))
                         },
                         _ => None
                     }
@@ -1359,7 +1411,7 @@ async fn process_command(
 
             let last_id = if let Some(DataType::Stream(existing)) = data_store.get_mut(stream_key) {
                 let presorted = existing.clone();
-                let mut sorted: Vec<String> = presorted.keys().map(|s| s.clone()).collect();
+                let mut sorted: Vec<_> = presorted.keys().map(|s| s.clone()).collect();
                 sorted.sort_by_key(|a| a.clone());
                 if let Some(last) = sorted.last() {
                     Some((last.clone(), existing))
@@ -1372,94 +1424,69 @@ async fn process_command(
 
             match (last_id, valid_pattern) {
                 (Some((last_id, existing)), Some(XaddIdPattern::Auto)) => {
-                    let new_id = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+                    let mut new_id = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
                         Ok(n) => {
-                            format!("{}-0", n.as_millis())
+                            StreamId{ms: n.as_micros(), seq: 0}
                         },
                         Err(_) => panic!("SystemTime before UNIX EPOCH!"),
                     };
-                    let vlast_id: Vec<u64> = last_id.split("-").map(|s| s.parse::<u64>().unwrap_or(0)).collect();
-                    let vnew_id: Vec<u64> = new_id.split("-").map(|s| s.parse::<u64>().unwrap_or(0)).collect();
-                    let zipid: Vec<_> = zip(vlast_id, vnew_id).collect();
-                    let first = zipid.first().unwrap();
-                    let last = zipid.last().unwrap();
-                    if first.0 == first.1 {
-                        let new_id = format!("{}-{}", first.0, last.0 + 1);
-                        existing.insert(new_id.clone(), zipped.clone());
-                        bulk_string_resp(new_id.as_str())
-                    } else if first.0 > first.1 {
+
+                    if last_id == new_id {
+                        new_id.seq += 1;
+                        existing.insert(new_id, zipped.clone());
+                        bulk_string_resp(new_id.to_string().as_str())
+                    } else if last_id >= new_id {
                         simple_error_resp("ERR The ID specified in XADD is equal or smaller than the target stream top item")
-                    } else if first.0 < first.1 {
-                        existing.insert(new_id.clone(), zipped.clone());
-                        bulk_string_resp(new_id.as_str())
                     } else {
                         existing.insert(new_id.clone(), zipped.clone());
-                        bulk_string_resp(&new_id)
+                        bulk_string_resp(new_id.to_string().as_str())
                     }
                 },
                 (None, Some(XaddIdPattern::Auto)) => {
                     let new_id = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
                         Ok(n) => {
-                            format!("{}-0", n.as_millis())
+                            StreamId{ms: n.as_micros(), seq: 0}
                         },
                         Err(_) => panic!("SystemTime before UNIX EPOCH!"),
                     };
                     let data = DataType::Stream(HashMap::from_iter([(new_id.clone(), zipped.clone())]));
                     data_store.insert(stream_key.to_string(), data);
-                    bulk_string_resp(&new_id)
+                    bulk_string_resp(new_id.to_string().as_str())
                 },
                 (Some((last_id, existing)), Some(XaddIdPattern::PartialAuto(new_id))) => {
-                    let nnew_id = if new_id.as_str() == "0" {
-                        format!("{}-1", new_id)
+                    let mut new_id = if new_id == 0 {
+                        StreamId{ms:0, seq:1}
                     } else {
-                        format!("{}-0", new_id)
+                        StreamId{ms:new_id, seq:0}
                     };
-                    let vlast_id: Vec<_> = last_id.split("-").collect();
-                    let vnew_id: Vec<_> = nnew_id.split("-").collect();
-                    let zipid: Vec<_> = zip(vlast_id, vnew_id).collect();
-                    let first = zipid.first().unwrap();
-                    let last = zipid.last().unwrap();
-
-                    if first.0 == first.1 {
-                        let last_sub_id = last.0.parse::<u64>().unwrap();
-                        let new_id = format!("{}-{}", first.0, last_sub_id + 1);
+                    if last_id == new_id {
+                        new_id.seq = last_id.seq + 1;
                         existing.insert(new_id.clone(), zipped.clone());
-                        bulk_string_resp(new_id.as_str())
-                    } else if first.0 > first.1 {
+                        bulk_string_resp(new_id.to_string().as_str())
+                    } else if last_id >= new_id {
                         simple_error_resp("ERR The ID specified in XADD is equal or smaller than the target stream top item")
-                    } else if first.0 < first.1 {
-                        existing.insert(nnew_id.clone(), zipped.clone());
-                        bulk_string_resp(nnew_id.as_str())
                     } else {
-                        existing.insert(nnew_id.clone(), zipped.clone());
-                        bulk_string_resp(&nnew_id)
+                        existing.insert(new_id.clone(), zipped.clone());
+                        bulk_string_resp(new_id.to_string().as_str())
                     }
                 },
                 (None, Some(XaddIdPattern::PartialAuto(new_id))) => {
-                    let new_id = if new_id.as_str() == "0" {
-                        format!("{}-1", new_id)
+                    let new_id = if new_id == 0 {
+                        StreamId{ms:0, seq:1}
                     } else {
-                        format!("{}-0", new_id)
+                        StreamId{ms:new_id, seq:0}
                     };
                     
                     let data = DataType::Stream(HashMap::from_iter([(new_id.clone(), zipped.clone())]));
                     data_store.insert(stream_key.to_string(), data);
-                    bulk_string_resp(new_id.as_str())
+                    bulk_string_resp(new_id.to_string().as_str())
                 },
-                (Some((last_id, existing)), Some(XaddIdPattern::Manual(new_id))) => {
-                    let vlast_id: Vec<u64> = last_id.split("-").map(|s| s.parse::<u64>().unwrap_or(0)).collect();
-                    let vnew_id: Vec<u64> = new_id.split("-").map(|s| s.parse::<u64>().unwrap_or(0)).collect();
-                    let zipid: Vec<_> = zip(vlast_id, vnew_id).collect();
-                    let first = zipid.first().unwrap();
-                    let last = zipid.last().unwrap();
-
+                (Some((last_id, existing)), Some(XaddIdPattern::Manual(mut new_id))) => {
                     if let Some(_) = existing.get(&new_id) {
                         simple_error_resp("ERR The ID specified in XADD is equal or smaller than the target stream top item")
-                    } else if new_id.as_str() == "0-0" {
+                    } else if new_id == StreamId::min() {
                         simple_error_resp("ERR The ID specified in XADD must be greater than 0-0")
-                    } else if first.0 == first.1 && last.0 >= last.1 {
-                        simple_error_resp("ERR The ID specified in XADD is equal or smaller than the target stream top item")
-                    } else if first.0 > first.1 {
+                    } else if last_id >= new_id {
                         simple_error_resp("ERR The ID specified in XADD is equal or smaller than the target stream top item")
                     } else {
                         existing.insert(new_id, zipped.clone());
@@ -1467,33 +1494,56 @@ async fn process_command(
                     }
                 },
                 (None, Some(XaddIdPattern::Manual(new_id))) => {
-                    if new_id == "0-0" {
+                    if new_id == StreamId::min() {
                         simple_error_resp("ERR The ID specified in XADD must be greater than 0-0")
                     } else {
                         let data = DataType::Stream(HashMap::from_iter([(new_id.clone(), zipped.clone())]));
                         data_store.insert(stream_key.to_string(), data);
-                        bulk_string_resp(new_id.as_str())
+                        bulk_string_resp(new_id.to_string().as_str())
                     }
                 },
                 _ => simple_error_resp("ERR Invalid stream ID specified as stream command argument")
             }
         },
         Command::Xrange(com_args) => {
-            match com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().as_slice() {
+            let args = com_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+            let pattern = match args.as_slice() {
+                [key, "-", "+"] => {
+                    Some((key, StreamId::min(), StreamId::max()))
+                }
+                [key, "-", end] => {
+                    match StreamId::try_from(end) {
+                        Some(end_id) => Some((key, StreamId::min(), end_id)),
+                        None => None
+                    }
+                }
+                [key, start, "+"] => {
+                    match StreamId::try_from(start) {
+                        Some(start_id) => Some((key, start_id, StreamId::max())),
+                        None => None
+                    }
+                }
                 [key, start, end] => {
+                    match (StreamId::try_from(start), StreamId::try_from(end)) {
+                        (Some(start_id), Some(end_id)) => Some((key, start_id, end_id)),
+                        _ => None
+                    }
+                },
+                _ => None
+            };
+
+            match pattern {
+                Some((key, start_id, end_id)) => {
                     if let Some(DataType::Stream(entries)) = data_store.get_mut(*key) {
-                        let start = start.parse::<u64>().unwrap();
-                        let end = end.parse::<u64>().unwrap();
                         let presorted = entries.clone();
                         let mut sorted: Vec<_> = presorted.iter().collect();
                         sorted.sort_by_key(|a| a.0);
+                    
                         let mut data = vec![];
                         for (k, d) in sorted {
                             let mut subitem = vec![];
-                            let subs = k.split("-").map(|s| s.parse::<u64>().unwrap()).collect::<Vec<u64>>();
-                            let sub_id = subs.first().unwrap();
 
-                            if !(start <= *sub_id && *sub_id <= end) {
+                            if !(start_id <= *k && *k <= end_id) {
                                 continue;
                             }
                             
@@ -1501,7 +1551,7 @@ async fn process_command(
                                 subitem.push(subk.as_str());
                                 subitem.push(subv.as_str());
                             }
-                            let item_resp = array_nested_xrange_resp(k.as_str(), subitem);
+                            let item_resp = array_nested_xrange_resp(k.to_string().as_str(), subitem);
                             data.push(item_resp);
                         }
                         let data = data.iter_mut().map(|s| s.as_str()).collect();
