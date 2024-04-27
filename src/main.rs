@@ -1669,7 +1669,11 @@ async fn process_command(
             let resp = match args.as_slice() {
                 ["block", wait_millis, "streams", args @ ..] => {
                     let wait_millis = wait_millis.parse::<u64>().unwrap();
-                    let wait_millis = Duration::from_millis(wait_millis);
+                    let wait_millis = if wait_millis == 0 {
+                        Duration::MAX
+                    } else {
+                        Duration::from_millis(wait_millis)
+                    };
                     wait_for = wait_millis;
                     xread_args = args.to_vec().into_iter().map(|s| s.to_string()).collect::<Vec<String>>();
                     null_resp()
