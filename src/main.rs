@@ -1398,12 +1398,12 @@ async fn process_command(
 
                     if let Some(_) = existing.get(&new_id) {
                         simple_error_resp("ERR The ID specified in XADD is equal or smaller than the target stream top item")
+                    } else if new_id.as_str() == "0-0" {
+                        simple_error_resp("ERR The ID specified in XADD must be greater than 0-0")
                     } else if first.0 == first.1 && last.0 >= last.1 {
                         simple_error_resp("ERR The ID specified in XADD is equal or smaller than the target stream top item")
                     } else if first.0 > first.1 {
                         simple_error_resp("ERR The ID specified in XADD is equal or smaller than the target stream top item")
-                    } else if new_id.as_str() == "0-0" {
-                        simple_error_resp("ERR The ID specified in XADD must be greater than 0-0")
                     } else {
                         existing.insert(new_id, zipped.clone());
                         bulk_string_resp(id)
