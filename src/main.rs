@@ -338,7 +338,7 @@ struct RequestContext {
     should_send_repl_reply: bool,
     wait_for: Duration,
     wait_reached: usize,
-    xread_args: Vec<String>,
+    xread_args: Vec<(String, StreamId)>,
 }
 
 struct ReplicaConnection {
@@ -477,9 +477,8 @@ impl ConnectionManager {
                                     let elapsed = timenow.duration_since(wait_from);
                                     let mut inner_data_store = data_store.lock().await;
                                     let xread_args = context.xread_args.clone();
-                                    let xread_args = xread_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
                                     
-                                    match parse_xread_stream_command(xread_args.as_slice(), &mut inner_data_store) {
+                                    match parse_xread_stream_command(xread_args, &mut inner_data_store) {
                                         Ok(xread_resp) => {
                                             resp = xread_resp;
                                             break 'waitfor;
@@ -1029,64 +1028,47 @@ fn parse_args(args: Args) -> HashSet<ServerArg> {
     parsed_args
 }
 
-fn parse_xread_stream_command(args: &[&str], data_store: &mut HashMap<String, DataType>) -> Result<String, String> {
-    let args_len = args.len() % 2;
-    match args_len {
-        0 => {
-            let key_and_id: Vec<&[&str]> = args.chunks(args.len() / 2).collect();
-            let key_id_pairs: Vec<(&&str, &&str)> = zip(key_and_id[0], key_and_id[1]).collect();
-            let mut has_invalid_arg = false;
-            let mut has_matching_stream_id = true;
-            let mut filtered_data = vec![];
-            for (key, id) in key_id_pairs {
-                let start_id = StreamId::try_from(*id);
-                if let Some(start_id) = start_id {
-                    if data_store.contains_key(*key) {
-                        if let Some(DataType::Stream(entries)) = data_store.get_mut(*key) {
-                            let presorted = entries.clone();
-                            let mut sorted: Vec<_> = presorted.iter().collect();
-                            sorted.sort_by_key(|a| a.0);
-                            
-                            let mut inner_data = vec![];
-                            'inner: for (stream_id, data) in sorted {
-                                let mut subitem = vec![];
-                                // println!("{:?} - {:?}", *stream_id, start_id);
-                                if *stream_id <= start_id {
-                                    has_matching_stream_id = false;
-                                    continue 'inner;
-                                } else {
-                                    has_matching_stream_id = true;
-                                }
+fn parse_xread_stream_command(parsed_pairs: Vec<(String, StreamId)>, data_store: &mut HashMap<String, DataType>) -> Result<String, String> {
+    let mut has_matching_stream_id = true;
+    let mut filtered_data = vec![];
 
-                                for (subk, subv) in data {
-                                    subitem.push(subk.as_str());
-                                    subitem.push(subv.as_str());
-                                }
-                                let item_resp = array_nested_xrange_resp(stream_id.to_string().as_str(), subitem);
-                                inner_data.push(item_resp);
-                            }
-                            let inner_data = inner_data.iter_mut().map(|s| s.as_str()).collect();
-                            let mut nested_stream = vec![bulk_string_resp(key), array_nested_resp(inner_data)];
-                            let nested_stream = nested_stream.iter_mut().map(|s| s.as_str()).collect();
-                            filtered_data.push(array_nested_resp(nested_stream));
-                        }
+    for (key, start_id) in parsed_pairs {
+        if data_store.contains_key(&key) {
+            if let Some(DataType::Stream(entries)) = data_store.get_mut(&key) {
+                let presorted = entries.clone();
+                let mut sorted: Vec<_> = presorted.iter().collect();
+                sorted.sort_by_key(|a| a.0);
+                
+                let mut inner_data = vec![];
+                'inner: for (stream_id, data) in sorted {
+                    let mut subitem = vec![];
+                    // println!("{:?} - {:?}", *stream_id, start_id);
+                    if *stream_id <= start_id {
+                        has_matching_stream_id = false;
+                        continue 'inner;
+                    } else {
+                        has_matching_stream_id = true;
                     }
-                } else {
-                    has_invalid_arg = true;
-                    break;
+
+                    for (subk, subv) in data {
+                        subitem.push(subk.as_str());
+                        subitem.push(subv.as_str());
+                    }
+                    let item_resp = array_nested_xrange_resp(stream_id.to_string().as_str(), subitem);
+                    inner_data.push(item_resp);
                 }
+                let inner_data = inner_data.iter_mut().map(|s| s.as_str()).collect();
+                let mut nested_stream = vec![bulk_string_resp(&key), array_nested_resp(inner_data)];
+                let nested_stream = nested_stream.iter_mut().map(|s| s.as_str()).collect();
+                filtered_data.push(array_nested_resp(nested_stream));
             }
-            if has_invalid_arg {
-                Err(simple_error_resp("ERR Invalid stream ID specified as stream command argument"))
-            } else if filtered_data.len() == 0 || !has_matching_stream_id {
-                Err(null_resp())
-            } else {
-                let nested_response = filtered_data.iter_mut().map(|s| s.as_str()).collect();
-                let nested_response = array_nested_resp(nested_response);
-                Ok(nested_response)
-            }
-        },
-        _ => Err(simple_error_resp("ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified."))
+        }
+    }
+    if filtered_data.len() == 0 || !has_matching_stream_id {
+        Err(null_resp())
+    } else {
+        let nested_response = filtered_data.iter_mut().map(|s| s.as_str()).collect();
+        Ok(array_nested_resp(nested_response))
     }
 }
 
@@ -1209,7 +1191,7 @@ async fn process_command(
     let mut add_repl_client = false;
     let mut wait_for = Duration::from_millis(0);
     let mut wait_reached = 0;
-    let mut xread_args: Vec<String> = vec![];
+    let mut xread_args: Vec<(String, StreamId)> = vec![];
     let response = match command {
         Command::Ping => {
             simple_resp("PONG")
@@ -1674,12 +1656,90 @@ async fn process_command(
                     } else {
                         Duration::from_millis(wait_millis)
                     };
-                    wait_for = wait_millis;
-                    xread_args = args.to_vec().into_iter().map(|s| s.to_string()).collect::<Vec<String>>();
-                    null_resp()
+                    let mut parsed_pairs = vec![];
+                    let args_len_mod = args.len() % 2;
+                    
+                    match args_len_mod {
+                        0 => {
+                            let key_and_id: Vec<&[&str]> = args.chunks(args.len() / 2).collect();
+                            let key_id_pairs: Vec<(&&str, &&str)> = zip(key_and_id[0], key_and_id[1]).collect();
+                            let mut has_invalid_arg = false;
+
+                            for (key, id) in key_id_pairs {
+                                if *id == "$" {
+                                    if let Some(DataType::Stream(entries)) = data_store.get_mut(*key) {
+                                        let presorted = entries.clone();
+                                        let mut sorted: Vec<_> = presorted.iter().collect();
+                                        sorted.sort_by_key(|a| a.0);
+                                        let last_sorted = sorted.clone();
+                                        let (last_id, _) = last_sorted.last().unwrap();
+                                        // println!("last_id {:?}", last_id);
+                                        parsed_pairs.push((key.to_string(), **last_id));
+                                    } else {
+                                        parsed_pairs.push((key.to_string(), StreamId::min()));
+                                    }
+                                }  else {
+                                    let stream_id = StreamId::try_from(*id);
+                                    if let Some(stream_id) = stream_id {
+                                        parsed_pairs.push((key.to_string(), stream_id));
+                                    } else {
+                                        has_invalid_arg = true;
+                                    }
+                                }
+                            }
+
+                            if has_invalid_arg {
+                                simple_error_resp("ERR Invalid stream ID specified as stream command argument")
+                            } else {
+                                wait_for = wait_millis;
+                                xread_args = parsed_pairs;
+                                null_resp()
+                            }
+                        },
+                        _ => simple_error_resp("ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.")
+                    }
                 },
                 ["streams", args @ ..] => {
-                    parse_xread_stream_command(args, data_store).unwrap()
+                    let mut parsed_pairs = vec![];
+                    let args_len_mod = args.len() % 2;
+                    let mut has_invalid_arg = false;
+
+                    match args_len_mod {
+                        0 => {
+                            let key_and_id: Vec<&[&str]> = args.chunks(args.len() / 2).collect();
+                            let key_id_pairs: Vec<(&&str, &&str)> = zip(key_and_id[0], key_and_id[1]).collect();
+                
+                            for (key, id) in key_id_pairs {
+                                if *id == "$" {
+                                    if let Some(DataType::Stream(entries)) = data_store.get_mut(*key) {
+                                        let presorted = entries.clone();
+                                        let mut sorted: Vec<_> = presorted.iter().collect();
+                                        sorted.sort_by_key(|a| a.0);
+                                        let last_sorted = sorted.clone();
+                                        let (last_id, _) = last_sorted.last().unwrap();
+                                        // println!("last_id {:?}", last_id);
+                                        parsed_pairs.push((key.to_string(), **last_id));
+                                    } else {
+                                        parsed_pairs.push((key.to_string(), StreamId::min()));
+                                    }
+                                }  else {
+                                    let stream_id = StreamId::try_from(*id);
+                                    if let Some(stream_id) = stream_id {
+                                        parsed_pairs.push((key.to_string(), stream_id));
+                                    } else {
+                                        has_invalid_arg = true;
+                                    }
+                                }
+                            }
+
+                            if has_invalid_arg {
+                                simple_error_resp("ERR Invalid stream ID specified as stream command argument")
+                            } else {
+                                parse_xread_stream_command(parsed_pairs, data_store).unwrap()
+                            }
+                        },
+                        _ => simple_error_resp("ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.")
+                    }
                 },
                 _ => arg_error_resp("xread")
             };
